@@ -1,0 +1,11 @@
+.build/
+build/
+.swiftpm/
+.DS_Store
+__pycache__/
+*.pyc
+
+# Personal documents used as regression-test fixtures -- kept locally so
+# tests/regression_test.py has stable copies immune to normal Downloads
+# cleanup, but not meant for version control. See tests/regression_test.py.
+tests/regression_fixtures/
