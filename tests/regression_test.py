@@ -381,7 +381,11 @@ CHECKS: list[Check] = [
         must_contain=["Parkway Mileposts", "Birds, Bears", "DAVID MCKENZIE"],
         must_not_contain=["SIVAD", "ANNAOJ"],  # the original reversed-caption bug
         slow=True,
-        timeout=400,
+        # Timed at 302s and 315s with the machine moderately busy and 870-906s
+        # with it short of memory (2026-10-10); 400s turned every such run
+        # into a WARN. The old and new driver were timed side by side when
+        # this was raised, so the headroom is not hiding a slowdown.
+        timeout=900,
     ),
     Check(
         name="Guidebook ebook PDF (128pp) -- multi-column body text, no-gutter page",
@@ -554,6 +558,47 @@ def check_no_cloud_transcription(python_bin: Path) -> tuple[str, list[str]]:
     return "PASS", []
 
 
+def check_docling_crash_falls_back(python_bin: Path, driver: Path) -> tuple[str, list[str]]:
+    """
+    A crash inside docling's native code must not fail the conversion: the
+    driver has to fall back to markitdown. The crash is staged by putting a
+    stand-in `docling` package first on PYTHONPATH that kills its own process
+    with SIGSEGV on import, which is what a real native crash looks like to
+    the driver. The fixture is an English PDF with a text layer, so it is
+    routed to docling and markitdown can still read it afterwards.
+    """
+    import os
+    import tempfile
+
+    pdf_path = SYNTHETIC_FIXTURES_DIR / "english_text_layer.pdf"
+    if not pdf_path.is_file():
+        return "FAIL", [f"fixture not found: {pdf_path}"]
+    with tempfile.TemporaryDirectory() as tmp:
+        package = Path(tmp) / "docling"
+        package.mkdir()
+        (package / "__init__.py").write_text("")
+        (package / "document_converter.py").write_text(
+            "import os, signal\nos.kill(os.getpid(), signal.SIGSEGV)\n"
+        )
+        env = dict(os.environ, PYTHONPATH=tmp, PYTHONDONTWRITEBYTECODE="1")
+        try:
+            proc = subprocess.run(
+                [str(python_bin), "-B", str(driver), str(pdf_path)],
+                capture_output=True, text=True, timeout=120, env=env,
+            )
+        except subprocess.TimeoutExpired:
+            return "FAIL", ["conversion timed out after 120s"]
+    if proc.returncode != 0:
+        return "FAIL", [f"the driver died with the crash (exit {proc.returncode}) instead of falling back"]
+    try:
+        markdown = json.loads(proc.stdout)["markdown"]
+    except (json.JSONDecodeError, KeyError) as exc:
+        return "FAIL", [f"driver produced unusable output: {exc}"]
+    if "The bus leaves the main gate" not in markdown:
+        return "FAIL", ["fallback output is missing the document's text"]
+    return "PASS", []
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--full", action="store_true", help="also run slow Docling-routed checks")
@@ -610,6 +655,15 @@ def main() -> int:
         failed.append("Runtime has no cloud-transcription packages")
     elif status == "WARN":
         inconclusive.append("Runtime has no cloud-transcription packages")
+
+    if not args.only:
+        name = "A crash inside docling falls back to markitdown"
+        status, notes = check_docling_crash_falls_back(python_bin, driver)
+        print(f"[{status}] {name}", flush=True)
+        for note in notes:
+            print(f"       {note}", flush=True)
+        if status == "FAIL":
+            failed.append(name)
 
     for check in checks:
         status, notes = run_check(

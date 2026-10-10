@@ -30,8 +30,10 @@ Engine routing (PDF only):
     early 2026: https://github.com/docling-project/docling/issues/3021).
     A `docling` failure of any kind (unsupported PDF, missing models, a
     native crash, etc.) silently falls back to `markitdown` rather than
-    breaking a conversion that used to work -- see `_convert_via_docling`
-    and its call site in `main()`.
+    breaking a conversion that used to work. `docling` runs in a child
+    process for that reason: a crash inside its native libraries kills
+    the process it happens in, so only a separate process leaves this one
+    alive to fall back -- see `_convert_via_docling_subprocess`.
 
 This script is copied into the app bundle's Contents/Resources and is run
 by the bundled Python interpreter as a subprocess from the Swift app
@@ -430,11 +432,78 @@ def _locate_model_cache_dir() -> str | None:
     return None
 
 
+_DOCLING_WORKER_FLAG = "--docling-worker"
+
+
+def _convert_via_docling_subprocess(path: str) -> str:
+    """
+    Converts `path` with docling in a child process (this same script, run
+    with `_DOCLING_WORKER_FLAG`) and returns the Markdown. Raises on any
+    failure, including the child being killed by a signal.
+
+    docling's native libraries (PyTorch, onnxruntime) can crash with SIGSEGV,
+    seen repeatedly on a 76-page document while the machine was short of
+    memory. A crash like that is not a Python exception: run in-process it
+    took the whole driver down, fallback code included, and the user got
+    "Conversion failed" for a file markitdown could have converted.
+
+    If this process is told to stop (the app stops a conversion on timeout
+    or when its card is removed), the child is stopped first -- otherwise it
+    would carry on converting, with its models in memory, for nobody.
+    """
+    import signal
+    import subprocess
+
+    child = subprocess.Popen(
+        [sys.executable, "-B", os.path.abspath(__file__), _DOCLING_WORKER_FLAG, path],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+
+    def stop_child(signum, frame):  # type: ignore[no-untyped-def]
+        child.kill()
+        sys.exit(128 + signum)
+
+    previous = {s: signal.signal(s, stop_child) for s in (signal.SIGTERM, signal.SIGINT)}
+    try:
+        stdout, _ = child.communicate()
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
+
+    if child.returncode != 0:
+        raise RuntimeError(f"docling worker exited with {child.returncode}")
+    return json.loads(stdout)["markdown"]
+
+
+def _docling_worker(path: str) -> int:
+    """Child-process side of `_convert_via_docling_subprocess`: converts
+    `path` and prints {"markdown": ...}. Any failure is a non-zero exit."""
+    import threading
+    import time
+
+    parent = os.getppid()
+
+    def exit_with_parent() -> None:
+        # The parent's signal handler cannot run if it is killed outright.
+        while os.getppid() == parent:
+            time.sleep(1)
+        os._exit(1)
+
+    threading.Thread(target=exit_with_parent, daemon=True).start()
+
+    try:
+        markdown = _convert_via_docling(path)
+    except Exception:
+        return 1
+    json.dump({"markdown": markdown}, sys.stdout, ensure_ascii=False)
+    return 0
+
+
 def _convert_via_docling(path: str) -> str:
     """
     Converts `path` with docling, returning the exported Markdown. Raises
-    on any failure -- callers are expected to catch broadly and fall back
-    to `_run_markitdown`.
+    on any failure. Runs in the worker process (see `_docling_worker`).
 
     Sets up fully-offline operation (bundled model cache, no network
     fallback) and suppresses docling's/rapidocr's verbose logging before
@@ -722,6 +791,9 @@ _AUDIO_EXTENSIONS = (".wav", ".mp3", ".m4a", ".mp4")
 
 
 def main() -> int:
+    if len(sys.argv) == 3 and sys.argv[1] == _DOCLING_WORKER_FLAG:
+        return _docling_worker(sys.argv[2])
+
     if len(sys.argv) != 2:
         print(f"Usage: {sys.argv[0]} <path-to-file>", file=sys.stderr)
         return 2
@@ -752,11 +824,12 @@ def main() -> int:
 
     if use_docling:
         try:
-            text = _convert_via_docling(path)
+            text = _convert_via_docling_subprocess(path)
             ocr_derived = alpha_count < _HEBREW_MIN_ALPHA_CHARS
         except Exception:
             # docling failed (unsupported/corrupt PDF, missing models, a
-            # native crash, whatever) -- fall back to markitdown below
+            # native crash in its worker process, whatever) -- fall back to
+            # markitdown below
             # rather than breaking a conversion that used to work. Not
             # treated as fatal, and deliberately not logged: only a total
             # failure (both engines) is worth telling the user about, via

@@ -207,6 +207,8 @@ For non-Hebrew PDFs, `convert_driver.py` now tries [`docling`](https://github.co
 
 This substantially grows the bundled runtime: PyTorch + `docling`'s own dependencies add roughly 1.2GB to `python-runtime` on top of what `markitdown`'s extras need, plus the ~530MB model cache — pushing `MarkItDown.app` from tens of MB to roughly 2.6GB total. Expected and accepted as the cost of fully offline ML-based layout analysis.
 
+**`docling` runs in its own process.** The driver starts a second copy of itself (`convert_driver.py --docling-worker <file>`) for the `docling` conversion and reads the Markdown back. The fallback to `markitdown` used to cover Python exceptions only: a crash inside `docling`'s native libraries (SIGSEGV, seen on four of eight conversions of a 76-page document while the machine was short of memory) killed the driver itself, fallback included, and the app reported "Conversion failed". Now only the worker dies and the driver falls back. If the driver is stopped (the app's timeout, or removing a card) it stops the worker first, and a worker whose driver has disappeared exits within a second. Checked by staging the crash (a stand-in `docling` that kills its process on import), which is also a standing regression check, and by sending the driver SIGTERM and SIGKILL with a worker running.
+
 **Scope note**: this routing currently applies to `.pdf` files only — DOCX/PPTX/XLSX/etc. are unaffected and still go through `MarkItDown().convert()` exactly as before. Extending the same pattern to other formats is a reasonable follow-up if `docling`'s layout handling would help there too, but was out of scope here.
 
 ## Known gaps / deferred

@@ -1,0 +1,32 @@
+%PDF-1.4
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /Resources << /Font << /F1 4 0 R >> >> /MediaBox [0 0 612 792] /Contents 5 0 R >>
+endobj
+4 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+5 0 obj
+<< /Length 446 >>
+stream
+BT /F1 13 Tf 72 720 Td 18 TL (Field trip to the science museum) Tj T* (The bus leaves the main gate at half past seven in the morning.) Tj T* (Students should bring water, a hat and comfortable walking shoes.) Tj T* (Please return the signed permission form to the class teacher by Thursday.) Tj T* (We will visit the planetarium first and the energy exhibition after lunch.) Tj T* (The group returns to school at four in the afternoon.) Tj T* ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000009 00000 n 
+0000000058 00000 n 
+0000000115 00000 n 
+0000000241 00000 n 
+0000000311 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+808
+%%EOF
