@@ -12,6 +12,15 @@ final class ConversionViewModel: ObservableObject {
 
     private var service: ConversionService?
 
+    /// Files waiting for their turn, oldest first. Conversions run one at a
+    /// time: each is its own Python process, and a PDF routed to docling
+    /// loads its layout and OCR models into that process, so starting one
+    /// per dropped file at once multiplied both memory and CPU load.
+    private var waitingIDs: [DroppedFile.ID] = []
+    /// The conversion in progress, if any -- kept so removing its card can
+    /// stop it instead of leaving the queue waiting on an unwanted result.
+    private var current: (id: DroppedFile.ID, task: Task<Void, Never>)?
+
     init() {
         do {
             service = try ConversionService()
@@ -34,7 +43,7 @@ final class ConversionViewModel: ObservableObject {
         for url in urls {
             let file = DroppedFile(url: url)
             files.append(file)
-            convert(file)
+            enqueue(file.id)
         }
     }
 
@@ -42,23 +51,41 @@ final class ConversionViewModel: ObservableObject {
         files.firstIndex { $0.id == id }
     }
 
-    private func convert(_ file: DroppedFile) {
-        guard let service else {
-            update(file.id, status: .failed(serviceUnavailableMessage ?? "Python runtime unavailable."))
+    private func enqueue(_ id: DroppedFile.ID) {
+        guard service != nil else {
+            update(id, status: .failed(serviceUnavailableMessage ?? "Python runtime unavailable."))
             return
         }
-        update(file.id, status: .converting)
-        Task {
-            do {
-                let output = try await service.convert(fileURL: file.url)
-                if output.needsConfirmation {
-                    update(file.id, status: .needsReview(markdown: output.markdown, warnings: output.warnings))
-                } else {
-                    update(file.id, status: .done(markdown: output.markdown, warnings: output.warnings))
+        guard current?.id != id, !waitingIDs.contains(id) else { return }
+        update(id, status: .pending)
+        waitingIDs.append(id)
+        startNextIfIdle()
+    }
+
+    private func startNextIfIdle() {
+        guard current == nil, let service else { return }
+        while !waitingIDs.isEmpty {
+            let id = waitingIDs.removeFirst()
+            // Skips a file whose card was removed while it waited.
+            guard let idx = index(of: id) else { continue }
+            let url = files[idx].url
+            update(id, status: .converting)
+            let task = Task {
+                do {
+                    let output = try await service.convert(fileURL: url)
+                    if output.needsConfirmation {
+                        update(id, status: .needsReview(markdown: output.markdown, warnings: output.warnings))
+                    } else {
+                        update(id, status: .done(markdown: output.markdown, warnings: output.warnings))
+                    }
+                } catch {
+                    update(id, status: .failed(error.localizedDescription))
                 }
-            } catch {
-                update(file.id, status: .failed(error.localizedDescription))
+                current = nil
+                startNextIfIdle()
             }
+            current = (id, task)
+            return
         }
     }
 
@@ -68,7 +95,7 @@ final class ConversionViewModel: ObservableObject {
     }
 
     func retry(_ file: DroppedFile) {
-        convert(file)
+        enqueue(file.id)
     }
 
     /// The user has reviewed a `.needsReview` file's content and wants to
@@ -82,6 +109,12 @@ final class ConversionViewModel: ObservableObject {
 
     func remove(_ file: DroppedFile) {
         files.removeAll { $0.id == file.id }
+        waitingIDs.removeAll { $0 == file.id }
+        if current?.id == file.id {
+            // Stops the Python process; the task then clears `current` and
+            // starts the next file.
+            current?.task.cancel()
+        }
         if expandedID == file.id {
             expandedID = nil
         }

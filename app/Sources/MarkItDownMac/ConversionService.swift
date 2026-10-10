@@ -27,6 +27,7 @@ enum ConversionError: LocalizedError {
     case processFailed(exitCode: Int32, stderr: String)
     case launchFailed(String)
     case malformedOutput(String)
+    case timedOut(minutes: Int)
 
     var errorDescription: String? {
         switch self {
@@ -44,6 +45,9 @@ enum ConversionError: LocalizedError {
             return "Could not launch the conversion process: \(message)"
         case .malformedOutput(let message):
             return "Conversion process produced unreadable output: \(message)"
+        case .timedOut(let minutes):
+            return "Conversion was stopped after \(minutes) minutes without finishing. "
+                + "The file may be too large or the converter may have stalled on it."
         }
     }
 }
@@ -56,6 +60,14 @@ final class ConversionService {
     private let pythonPath: URL
     /// Absolute path to `convert_driver.py`.
     private let driverPath: URL
+
+    /// How long one conversion may run before its process is stopped. The
+    /// slowest legitimate conversion measured so far (a 128-page illustrated
+    /// guidebook through docling) took about 8.5 minutes on an idle machine,
+    /// so this leaves several times that; it exists to end a stalled process,
+    /// not to police slow ones. Without it a stall would hold up every file
+    /// queued behind it (conversions run one at a time).
+    static let conversionTimeout: TimeInterval = 30 * 60
 
     init() throws {
         let (python, driver) = try Self.locateRuntime()
@@ -112,10 +124,17 @@ final class ConversionService {
     /// output (e.g. flags visual content that couldn't be converted to
     /// text) and reports that alongside the Markdown; see
     /// `ConversionOutput`. Throws `ConversionError` with the captured
-    /// stderr on failure.
-    func convert(fileURL: URL) async throws -> ConversionOutput {
-        try await withCheckedThrowingContinuation { continuation in
-            let process = Process()
+    /// stderr on failure. Cancelling the calling task stops the process, and
+    /// so does running longer than `conversionTimeout`.
+    func convert(
+        fileURL: URL,
+        timeout timeoutInterval: TimeInterval = ConversionService.conversionTimeout
+    ) async throws -> ConversionOutput {
+        let process = Process()
+        let timedOut = SynchronizedFlag()
+
+        return try await withTaskCancellationHandler {
+          try await withCheckedThrowingContinuation { continuation in
             process.executableURL = pythonPath
             process.arguments = [driverPath.path, fileURL.path]
 
@@ -140,13 +159,25 @@ final class ConversionService {
                 }
             }
 
+            let timeout = DispatchWorkItem {
+                if process.isRunning {
+                    timedOut.set()
+                    process.terminate()
+                }
+            }
+
             process.terminationHandler = { proc in
+                timeout.cancel()
                 stdoutPipe.fileHandleForReading.readabilityHandler = nil
                 stderrPipe.fileHandleForReading.readabilityHandler = nil
 
                 let stderrString = String(data: stderrData.value, encoding: .utf8) ?? ""
 
-                if proc.terminationStatus == 0 {
+                if timedOut.isSet {
+                    continuation.resume(throwing: ConversionError.timedOut(
+                        minutes: Int(timeoutInterval / 60)
+                    ))
+                } else if proc.terminationStatus == 0 {
                     do {
                         let output = try JSONDecoder().decode(ConversionOutput.self, from: stdoutData.value)
                         continuation.resume(returning: output)
@@ -165,8 +196,42 @@ final class ConversionService {
                 try process.run()
             } catch {
                 continuation.resume(throwing: ConversionError.launchFailed(error.localizedDescription))
+                return
+            }
+            DispatchQueue.global().asyncAfter(
+                deadline: .now() + timeoutInterval, execute: timeout
+            )
+            // A cancellation that arrived before the process was running had
+            // nothing to stop (see onCancel below), so honour it here.
+            if Task.isCancelled {
+                process.terminate()
+            }
+          }
+        } onCancel: {
+            // `terminate()` raises on a process that was never launched.
+            if process.isRunning {
+                process.terminate()
             }
         }
+    }
+}
+
+/// Small thread-safe flag: set from the timeout's queue, read from the
+/// process's termination handler.
+private final class SynchronizedFlag: @unchecked Sendable {
+    private var value = false
+    private let lock = NSLock()
+
+    func set() {
+        lock.lock()
+        value = true
+        lock.unlock()
+    }
+
+    var isSet: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
     }
 }
 

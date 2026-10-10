@@ -69,6 +69,11 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 FIXTURES_DIR = PROJECT_ROOT / "tests" / "regression_fixtures"
+# Generated test files with no personal content, so unlike the fixtures above
+# they are committed. The two scans are a page of text drawn as an image
+# (Pillow, 200 dpi) and saved as an image-only PDF; the text file is one
+# Hebrew sentence encoded as Windows-1255.
+SYNTHETIC_FIXTURES_DIR = PROJECT_ROOT / "tests" / "synthetic_fixtures"
 
 
 def _locate_runtime(prefer_dev: bool = False) -> tuple[Path, Path]:
@@ -107,6 +112,7 @@ def _locate_runtime(prefer_dev: bool = False) -> tuple[Path, Path]:
 class Check:
     name: str
     fixture: str | None = None  # filename within tests/regression_fixtures/
+    synthetic_fixture: str | None = None  # filename within tests/synthetic_fixtures/
     external_path: str | None = None  # absolute path, for documents not
     # appropriate to copy into the repo (e.g. copyrighted commercial
     # ebooks with an explicit "don't redistribute" notice) -- referenced
@@ -128,6 +134,9 @@ class Check:
     # extraction) the Markdown still looks plausible, so the only reliable
     # signal that the recovery path fired is the warning it emits.
     must_not_warn: list[str] = field(default_factory=list)
+    # Substrings some driver warning must contain: the positive counterpart,
+    # for input the app cannot convert and has to flag instead.
+    must_warn: list[str] = field(default_factory=list)
     # Pins the driver's needs_confirmation flag -- the gate that lands a
     # file in the app's "Needs review" state. None means don't care.
     expect_needs_confirmation: bool | None = None
@@ -139,6 +148,8 @@ class Check:
     def resolved_path(self) -> Path:
         if self.external_path:
             return Path(self.external_path)
+        if self.synthetic_fixture:
+            return SYNTHETIC_FIXTURES_DIR / self.synthetic_fixture
         assert self.fixture is not None
         return FIXTURES_DIR / self.fixture
 
@@ -275,6 +286,86 @@ CHECKS: list[Check] = [
         # and a regression of the font fix would trip it again.
         expect_needs_confirmation=False,
         timeout=180,
+    ),
+    Check(
+        name="Short Windows-1255 text file -- must not be decoded as Cyrillic",
+        synthetic_fixture="hebrew_windows1255_short.txt",
+        # 26 bytes: too little for markitdown's statistical charset guess,
+        # which read it as Windows-1251 (`їьхэ Ґхьэ`) with no warning.
+        must_contain=["שלום עולם, מה שלומך היום?"],
+        must_not_match=[r"[\u0400-\u04ff]"],
+        expect_needs_confirmation=False,
+        min_length=20,
+    ),
+    Check(
+        name="Semicolon-separated CSV with decimal commas -- must become a real table",
+        synthetic_fixture="hebrew_semicolon_decimal_comma.csv",
+        # markitdown's CSV converter splits on commas only: this came out as
+        # one column with the semicolons left inside the cells.
+        must_contain=["| שם | ממוצע | הערה |", "| דנה | 95,5 | טוב מאוד |"],
+        must_not_contain=[";"],
+        expect_needs_confirmation=False,
+        min_length=50,
+    ),
+    Check(
+        name="Tab-separated UTF-16 CSV (Excel 'Unicode Text') -- must become a real table",
+        synthetic_fixture="hebrew_tab_utf16.csv",
+        must_contain=["| שם | כיתה | ציון |", "| דנה כהן | ה'2 | 95 |"],
+        must_not_contain=["\t"],
+        expect_needs_confirmation=False,
+        min_length=50,
+    ),
+    Check(
+        name="UTF-8 text file with a byte-order mark -- the mark must not reach the output",
+        synthetic_fixture="hebrew_utf8_bom.txt",
+        # Needs a file of some length: on a ten-character one the charset
+        # detection picked a codec that drops the mark by itself.
+        must_contain=["שלום לכולם. זהו מסמך בדיקה בעברית"],
+        must_not_contain=["\ufeff"],
+        expect_needs_confirmation=False,
+    ),
+    Check(
+        name="Abbreviation-dense Hebrew text -- correct text must not land in Needs review",
+        synthetic_fixture="hebrew_abbreviation_dense.txt",
+        # A Bible-lesson worksheet full of תנ"ך / עמ' abbreviations. The
+        # orthography counter reads each such stem as a violation: 13.2 per
+        # 1,000 on this correct text, against a threshold of 5.
+        must_contain=['קראו את בראשית פרק א\', פס\' א\'–ה\', ועיינו בפירוש רש"י שבעמ\' 12.'],
+        must_not_warn=["orthography violations"],
+        expect_needs_confirmation=False,
+    ),
+    Check(
+        name="Mirrored Hebrew text -- must land in Needs review",
+        # The same worksheet with every line reversed, as text extracted in
+        # visual order comes out. The one standing positive case for the
+        # orthography-rate gate: no real document trips it any more.
+        synthetic_fixture="hebrew_mirrored_lines.txt",
+        must_warn=["orthography violations"],
+        expect_needs_confirmation=True,
+    ),
+    # -- Slow (--full only): scans, read by Docling's OCR. The pair pins both
+    # sides of the "does this OCR output read as text" gate.
+    Check(
+        name="Scanned Hebrew PDF (no text layer) -- OCR noise must land in Needs review",
+        synthetic_fixture="hebrew_scan_no_text_layer.pdf",
+        # No text layer means no letters to sample, so it is routed to
+        # Docling, whose OCR cannot read Hebrew and returns Latin-looking
+        # noise. That used to be delivered as a clean conversion.
+        max_hebrew_fraction=0.15,
+        must_warn=["has no text layer"],
+        expect_needs_confirmation=True,
+        slow=True,
+        timeout=400,
+    ),
+    Check(
+        name="Scanned English PDF (no text layer) -- readable OCR must not be flagged",
+        synthetic_fixture="english_scan_no_text_layer.pdf",
+        max_hebrew_fraction=0.15,
+        must_contain=["Students will read the text and answer the questions"],
+        must_not_warn=["has no text layer"],
+        expect_needs_confirmation=False,
+        slow=True,
+        timeout=400,
     ),
     # -- Slow (--full only): Docling-routed English documents. Referenced
     # by external_path rather than copied into fixtures/ -- these are
@@ -418,6 +509,10 @@ def run_check(
         matched = [w for w in data.get("warnings", []) if needle in w]
         if matched:
             problems.append(f"driver warning matched {needle!r}: {matched[0][:140]}")
+
+    for needle in check.must_warn:
+        if not any(needle in w for w in data.get("warnings", [])):
+            problems.append(f"no driver warning contains {needle!r}")
 
     if (
         check.expect_needs_confirmation is not None

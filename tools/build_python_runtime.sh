@@ -124,11 +124,20 @@ echo "[build_python_runtime] Runtime python: $("$PYTHON_BIN" --version)"
 # ---------------------------------------------------------------------------
 # 4. Use the runtime's own pip to install the vendored markitdown package.
 # ---------------------------------------------------------------------------
+# Every package is pinned to the version recorded in runtime-constraints.txt
+# (see that file for how to upgrade deliberately). Without it each rebuild
+# pulled the newest docling and dependencies, i.e. an engine nobody had tested.
+CONSTRAINTS_FILE="$SCRIPT_DIR/runtime-constraints.txt"
+if [[ ! -f "$CONSTRAINTS_FILE" ]]; then
+    echo "[build_python_runtime] ERROR: missing $CONSTRAINTS_FILE" >&2
+    exit 1
+fi
+
 echo "[build_python_runtime] Upgrading pip..."
 "$PYTHON_BIN" -m pip install --upgrade pip --quiet
 
 echo "[build_python_runtime] Installing engine/vendor/markitdown[$EXTRAS] ..."
-"$PYTHON_BIN" -m pip install --quiet "$VENDOR_PKG[$EXTRAS]"
+"$PYTHON_BIN" -m pip install --quiet -c "$CONSTRAINTS_FILE" "$VENDOR_PKG[$EXTRAS]"
 
 echo "[build_python_runtime] Verifying import..."
 "$PYTHON_BIN" -c "from markitdown import MarkItDown; print('markitdown OK:', MarkItDown)"
@@ -145,7 +154,7 @@ echo "[build_python_runtime] Verifying import..."
 #    own dependencies, then ~500MB+ of model weights): expected and fine.
 # ---------------------------------------------------------------------------
 echo "[build_python_runtime] Installing docling..."
-"$PYTHON_BIN" -m pip install --quiet docling
+"$PYTHON_BIN" -m pip install --quiet -c "$CONSTRAINTS_FILE" docling
 
 echo "[build_python_runtime] Verifying docling import..."
 "$PYTHON_BIN" -c "from docling.document_converter import DocumentConverter; print('docling OK:', DocumentConverter)"

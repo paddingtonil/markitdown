@@ -11,7 +11,8 @@ validation pass over the result, then prints a single JSON object to stdout:
 `warnings` is empty when validation found nothing to flag. `needs_confirmation`
 is true only when the content looks unreliable enough (currently: a Hebrew
 orthography-violation rate far above this project's known-good baselines, or
-several lines with a symbol where a Hebrew letter should be) that the caller
+several lines with a symbol where a Hebrew letter should be, or OCR output
+from a PDF without a text layer that does not read as text) that the caller
 should ask the user before treating the conversion as done,
 rather than just displaying a warning -- see `_validate`. On failure, prints
 a clear message to stderr and exits with a non-zero status (no JSON is
@@ -105,8 +106,29 @@ def _hebrew_violation_rate(markdown: str) -> float | None:
     )
     if hebrew_letters < 500:
         return None
-    violations = _hebrew_orthography_violations(markdown)
+    violations = _hebrew_orthography_violations(markdown) - len(
+        _HEBREW_ABBREVIATION_STEM_PATTERN.findall(markdown)
+    )
     return violations / hebrew_letters * 1000
+
+
+# The stem of a Hebrew abbreviation: `תנ` in `תנ"ך`, `עמ` in `עמ'`. The
+# orthography counter splits words at the gershayim/geresh, sees a word that
+# ends in the regular form of a letter that has a final form, and counts a
+# violation -- on correct text. Text dense in such abbreviations (Bible and
+# rabbinic sources: תנ"ך, רמב"ם, חז"ל, עמ') could cross the threshold on
+# those alone: a correct 1,140-character test text read 7.6 per 1,000.
+#
+# Each match is exactly one violation the counter reports (a word of two
+# letters or more ending in כ/מ/נ/פ/צ), so the matches are subtracted from
+# its count. A gershayim only counts when a Hebrew letter follows it, so an
+# ordinary closing quotation mark is not mistaken for one. This is applied
+# to the validation rate only: the same counter also decides the direction
+# of each line in `_pdf_converter.py`, and changing it there would change
+# the text of documents that already convert correctly.
+_HEBREW_ABBREVIATION_STEM_PATTERN = re.compile(
+    r"(?<=[א-ת])[כמנפצ](?:[\"״](?=[א-ת])|['׳])"
+)
 
 
 # An ASCII symbol standing where a Hebrew letter should be, inside a Hebrew
@@ -150,7 +172,42 @@ _HEBREW_BLOCK_END = 0x05FF
 _HEBREW_FRACTION_THRESHOLD = 0.15
 
 
-def _validate(markdown: str) -> tuple[list[str], bool]:
+# docling's bundled OCR engine (RapidOCR) reads Latin and Chinese script only.
+# A scanned PDF in Hebrew has no text layer, so the Hebrew-fraction sample
+# sees no letters at all, the file is routed to docling, and the OCR returns
+# confident-looking noise (`UUUILIO ¿LXI XU LALOA IACI`). None of the Hebrew
+# checks above can see that, since the output contains no Hebrew letters.
+#
+# So for text that came from OCR (see `ocr_derived` in main()), this measures
+# how much of it reads as ordinary words: of the tokens containing a letter,
+# the share that is a lowercase or Capitalised ASCII word of two letters or
+# more. All-caps tokens are left out of the numerator on purpose -- the noise
+# is mostly capitals, while real text only uses them for headings.
+_OCR_WORDLIKE_PATTERN = re.compile(r"[A-Za-z][a-z]+(?:['’-][a-z]+)*")
+_OCR_MIN_LETTER_TOKENS = 20
+_OCR_WORDLIKE_THRESHOLD = 0.3
+
+
+def _ocr_wordlike_fraction(markdown: str) -> float | None:
+    """
+    Share of letter-bearing tokens that look like ordinary Latin-script
+    words, or None when there are too few tokens to judge either way.
+    """
+    letter_tokens = 0
+    wordlike = 0
+    for token in markdown.split():
+        if not any(ch.isalpha() for ch in token):
+            continue
+        letter_tokens += 1
+        core = token.strip("\"'“”‘’()[]{}<>.,:;!?*_#|-–—/")
+        if _OCR_WORDLIKE_PATTERN.fullmatch(core):
+            wordlike += 1
+    if letter_tokens < _OCR_MIN_LETTER_TOKENS:
+        return None
+    return wordlike / letter_tokens
+
+
+def _validate(markdown: str, ocr_derived: bool = False) -> tuple[list[str], bool]:
     """
     Lightweight, low-false-positive checks on the converted Markdown.
     Deliberately conservative: a warning here should mean something a user
@@ -166,7 +223,9 @@ def _validate(markdown: str) -> tuple[list[str], bool]:
     misleading -- currently: a Hebrew orthography-violation rate far above
     this project's own known-good baselines, or at least a few lines with a
     symbol standing where a Hebrew letter should be (the rate cannot see
-    those; see `_HEBREW_SYMBOL_SUBSTITUTION_PATTERN`). There is no automatic
+    those; see `_HEBREW_SYMBOL_SUBSTITUTION_PATTERN`), or OCR output that
+    does not read as text (`ocr_derived`: the PDF had no text layer and the
+    text was read from page images; see `_OCR_WORDLIKE_PATTERN`). There is no automatic
     correction available for that case (the two engines available on this
     machine were both tried and neither recovers a genuinely corrupted
     font encoding -- see README's Hebrew/RTL section), so the honest move
@@ -226,6 +285,19 @@ def _validate(markdown: str) -> tuple[list[str], bool]:
             "Please review the output before relying on it."
         )
 
+    if ocr_derived:
+        wordlike = _ocr_wordlike_fraction(markdown)
+        if wordlike is not None and wordlike < _OCR_WORDLIKE_THRESHOLD:
+            needs_confirmation = True
+            warnings.append(
+                "This PDF has no text layer (it is a scan), so its text was read "
+                "from the page images, and the result does not read as text "
+                f"(only {wordlike:.0%} of it looks like words). The text "
+                "recognition in this app cannot read Hebrew, so a scanned Hebrew "
+                "document comes out as meaningless characters. Please review the "
+                "output before relying on it."
+            )
+
     return warnings, needs_confirmation
 
 
@@ -257,10 +329,10 @@ def _evenly_spaced_indices(num_pages: int, count: int) -> list[int]:
     return sorted({round(i * step) for i in range(count)})
 
 
-def _estimate_hebrew_fraction(path: str) -> float:
+def _sample_pdf_letters(path: str) -> tuple[int, int]:
     """
-    Cheaply estimates what fraction of a PDF's alphabetic characters are
-    Hebrew: extracts text from a sample of pages via pdfplumber and counts
+    Counts (Hebrew letters, all alphabetic characters) in a sample of a
+    PDF's text layer: extracts text from a sample of pages via pdfplumber and counts
     characters in the Hebrew Unicode block against all alphabetic
     characters (any script). The sample starts small and evenly spaced
     (see `_evenly_spaced_indices`) and widens -- up to `_HEBREW_SAMPLE_MAX`
@@ -269,14 +341,14 @@ def _estimate_hebrew_fraction(path: str) -> float:
     so a document with long sparse/image-heavy stretches doesn't get judged
     on pages that happen to carry almost no text either way.
 
-    Returns 0.0 (i.e. "not Hebrew") if the PDF can't be opened/sampled at
-    all -- that failure will surface again, more informatively, when the
-    actual conversion is attempted.
+    Returns (0, 0) if the PDF can't be opened/sampled at all -- that
+    failure will surface again, more informatively, when the actual
+    conversion is attempted.
     """
     try:
         import pdfplumber
     except Exception:
-        return 0.0
+        return 0, 0
 
     hebrew_count = 0
     alpha_count = 0
@@ -309,8 +381,18 @@ def _estimate_hebrew_fraction(path: str) -> float:
                 sample_size = min(sample_size * 3, _HEBREW_SAMPLE_MAX, num_pages)
                 scan(_evenly_spaced_indices(num_pages, sample_size))
     except Exception:
-        return 0.0
+        return 0, 0
 
+    return hebrew_count, alpha_count
+
+
+def _estimate_hebrew_fraction(path: str) -> float:
+    """
+    Fraction of a PDF's sampled alphabetic characters that are Hebrew (see
+    `_sample_pdf_letters`); 0.0 (i.e. "not Hebrew") when the sample has no
+    letters at all.
+    """
+    hebrew_count, alpha_count = _sample_pdf_letters(path)
     if alpha_count == 0:
         return 0.0
     return hebrew_count / alpha_count
@@ -412,6 +494,173 @@ def _convert_via_docling(path: str) -> str:
     return markdown
 
 
+# Plain-text formats whose bytes markitdown decodes by statistical guessing
+# (charset_normalizer). HTML is not here: it went through the same tests and
+# came out right with and without a charset declaration.
+_LEGACY_CHARSET_EXTENSIONS = (".txt", ".text", ".md", ".markdown", ".csv")
+_LEGACY_CHARSET_SAMPLE_BYTES = 1 << 20
+_UNICODE_BOMS = (b"\xef\xbb\xbf", b"\xff\xfe", b"\xfe\xff")
+_HEBREW_POINT_PATTERN = re.compile(r"(?<![\u0591-\u05ea])[\u0591-\u05c7]")
+_HEBREW_LATIN_ADJACENT_PATTERN = re.compile(r"[A-Za-z][א-ת]|[א-ת][A-Za-z]")
+_HEBREW_FINAL_MIDWORD_PATTERN = re.compile(r"[ךםןףץ](?=[א-ת])")
+
+
+def _detect_legacy_hebrew_charset(path: str) -> str | None:
+    """
+    Returns "cp1255" when a text file is Hebrew in the legacy Windows
+    encoding (ISO-8859-8 text decodes identically for the letters), else
+    None, which leaves the decision to markitdown's own detection.
+
+    That detection is statistical and needs more text than a short file
+    has: a 26-byte Hebrew file was decoded as Cyrillic (Windows-1251), with
+    no warning, because the two encodings use the same byte range for their
+    letters. The bytes alone cannot tell the two apart, so this asks whether
+    the Windows-1255 reading is plausible *Hebrew*:
+
+    - every byte must be defined in Windows-1255 (Russian text almost always
+      contains bytes that are not);
+    - nearly all non-ASCII characters must be Hebrew, and not glued to Latin
+      letters (rules out Western European text, where an accented letter
+      inside a Latin word would decode to a lone Hebrew letter);
+    - no vowel point without a letter before it (Cyrillic capitals decode
+      to points, at the start of words);
+    - final-form letters almost never mid-word (Cyrillic к, н, п, у decode
+      to ך, ם, ן, ף, which are everywhere inside Russian words).
+
+    Files that are valid UTF-8, carry a Unicode byte-order mark, or contain
+    NUL bytes (UTF-16/32) are never touched.
+    """
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(_LEGACY_CHARSET_SAMPLE_BYTES)
+    except OSError:
+        return None
+    return _legacy_hebrew_charset_of(data)
+
+
+def _legacy_hebrew_charset_of(data: bytes) -> str | None:
+    """The decision behind `_detect_legacy_hebrew_charset`, on bytes."""
+    if not data or data.startswith(_UNICODE_BOMS) or b"\x00" in data:
+        return None
+    try:
+        data.decode("utf-8")
+        return None
+    except UnicodeDecodeError as exc:
+        # A sample that merely ends inside a multi-byte UTF-8 character.
+        if len(data) == _LEGACY_CHARSET_SAMPLE_BYTES and exc.start >= len(data) - 4:
+            return None
+    try:
+        text = data.decode("cp1255")
+    except UnicodeDecodeError:
+        return None
+
+    non_ascii = sum(1 for ch in text if ord(ch) > 127)
+    hebrew = sum(1 for ch in text if _HEBREW_BLOCK_START <= ord(ch) <= _HEBREW_BLOCK_END)
+    letters = sum(1 for ch in text if "א" <= ch <= "ת")
+    if letters < 2 or hebrew < 0.8 * non_ascii:
+        return None
+    if _HEBREW_POINT_PATTERN.search(text):
+        return None
+    if len(_HEBREW_LATIN_ADJACENT_PATTERN.findall(text)) * 10 > letters:
+        return None
+    if len(_HEBREW_FINAL_MIDWORD_PATTERN.findall(text)) * 20 > letters:
+        return None
+    return "cp1255"
+
+
+# Delimiters a ".csv" file may use instead of a comma: Excel writes
+# semicolons under locales whose decimal separator is a comma, and its
+# "Unicode Text" export is tab-separated UTF-16.
+_CSV_ALTERNATIVE_DELIMITERS = (";", "\t", "|")
+_CSV_SNIFF_ROWS = 50
+
+
+def _csv_column_count(lines: list[str], delimiter: str) -> int:
+    """
+    The number of columns `lines` has when split on `delimiter`, or 0 when
+    that delimiter does not describe the file: fewer than two columns, a
+    header row of a different width, or under 90% of the rows agreeing.
+    """
+    import csv
+
+    try:
+        widths = [len(row) for row in csv.reader(lines, delimiter=delimiter) if row]
+    except csv.Error:
+        return 0
+    if not widths:
+        return 0
+    common = max(set(widths), key=widths.count)
+    if common < 2 or widths[0] != common or widths.count(common) < 0.9 * len(widths):
+        return 0
+    return common
+
+
+def _decode_text_bytes(data: bytes) -> str | None:
+    """Decodes a text file's bytes the way this driver reads text: Unicode
+    by its byte-order mark, then strict UTF-8, then legacy Hebrew, then
+    markitdown's own statistical detector."""
+    if data.startswith(b"\xef\xbb\xbf"):
+        return data[3:].decode("utf-8", errors="replace")
+    if data.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return data.decode("utf-16", errors="replace")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        pass
+    if _legacy_hebrew_charset_of(data):
+        return data.decode("cp1255")
+    try:
+        from charset_normalizer import from_bytes
+
+        best = from_bytes(data).best()
+    except Exception:
+        return None
+    return str(best) if best is not None else None
+
+
+def _normalize_csv(path: str) -> bytes | None:
+    """
+    Returns the content of a CSV file re-written as comma-separated UTF-8
+    when it uses another delimiter, else None (the file is passed to
+    markitdown untouched). markitdown's CSV converter only splits on commas,
+    so a semicolon- or tab-separated file came out as a one-column table with
+    the separators left inside the cells.
+
+    A file that reads consistently as comma-separated is never changed. For
+    the others the delimiter must give every sampled row the same number of
+    columns as the header (see `_csv_column_count`); when several qualify,
+    the one giving the most columns wins.
+    """
+    import csv
+    import io
+
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read()
+    except OSError:
+        return None
+    text = _decode_text_bytes(data)
+    if not text:
+        return None
+
+    sample = [line for line in text.splitlines() if line.strip()][:_CSV_SNIFF_ROWS]
+    if len(sample) < 2 or _csv_column_count(sample, ","):
+        return None
+    counts = {d: _csv_column_count(sample, d) for d in _CSV_ALTERNATIVE_DELIMITERS}
+    delimiter = max(counts, key=lambda d: counts[d])
+    if not counts[delimiter]:
+        return None
+
+    out = io.StringIO(newline="")
+    try:
+        csv.writer(out, lineterminator="\n").writerows(
+            csv.reader(io.StringIO(text, newline=""), delimiter=delimiter)
+        )
+    except csv.Error:
+        return None
+    return out.getvalue().encode("utf-8")
+
+
 def _run_markitdown(path: str) -> str | None:
     """
     Converts `path` with the vendored `markitdown` package -- the original,
@@ -431,7 +680,27 @@ def _run_markitdown(path: str) -> str | None:
 
     try:
         md = MarkItDown()
-        result = md.convert(path)
+        charset = (
+            _detect_legacy_hebrew_charset(path)
+            if path.lower().endswith(_LEGACY_CHARSET_EXTENSIONS)
+            else None
+        )
+        normalized_csv = _normalize_csv(path) if path.lower().endswith(".csv") else None
+        if normalized_csv is not None:
+            import io
+
+            from markitdown import StreamInfo
+
+            result = md.convert_stream(
+                io.BytesIO(normalized_csv),
+                stream_info=StreamInfo(extension=".csv", charset="utf-8"),
+            )
+        elif charset:
+            from markitdown import StreamInfo
+
+            result = md.convert(path, stream_info=StreamInfo(charset=charset))
+        else:
+            result = md.convert(path)
     except Exception as exc:
         print(f"Failed to convert '{path}': {exc}", file=sys.stderr)
         return None
@@ -469,10 +738,22 @@ def main() -> int:
         return 1
 
     text: str | None = None
+    # True when the text was read from page images rather than from the PDF's
+    # own text layer: docling produced it, and the sample of the text layer
+    # (up to `_HEBREW_SAMPLE_MAX` pages) found next to no letters.
+    ocr_derived = False
 
-    if path.lower().endswith(".pdf") and _estimate_hebrew_fraction(path) < _HEBREW_FRACTION_THRESHOLD:
+    use_docling = False
+    alpha_count = 0
+    if path.lower().endswith(".pdf"):
+        hebrew_count, alpha_count = _sample_pdf_letters(path)
+        hebrew_fraction = hebrew_count / alpha_count if alpha_count else 0.0
+        use_docling = hebrew_fraction < _HEBREW_FRACTION_THRESHOLD
+
+    if use_docling:
         try:
             text = _convert_via_docling(path)
+            ocr_derived = alpha_count < _HEBREW_MIN_ALPHA_CHARS
         except Exception:
             # docling failed (unsupported/corrupt PDF, missing models, a
             # native crash, whatever) -- fall back to markitdown below
@@ -487,7 +768,11 @@ def main() -> int:
         if text is None:
             return 1
 
-    warnings, needs_confirmation = _validate(text)
+    # A UTF-8 byte-order mark at the start of a text file survives decoding
+    # as an invisible U+FEFF character in front of the first word.
+    text = text.lstrip("\ufeff")
+
+    warnings, needs_confirmation = _validate(text, ocr_derived=ocr_derived)
 
     json.dump(
         {"markdown": text, "warnings": warnings, "needs_confirmation": needs_confirmation},
