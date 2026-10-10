@@ -25,6 +25,7 @@ actually happen once already in this project's history.
 
 Usage:
     python3 tests/regression_test.py            # fast checks only
+    python3 tests/regression_test.py --full --only Travel --timeout-factor 3   # re-run one flaky check
     python3 tests/regression_test.py --dev       # use build/python-runtime + engine/ (what the next build will contain)
     python3 tests/regression_test.py --full      # also the slow
                                                     # Docling-routed English
@@ -63,7 +64,7 @@ import re
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -463,6 +464,18 @@ def main() -> int:
     parser.add_argument("--full", action="store_true", help="also run slow Docling-routed checks")
     parser.add_argument("--verbose", action="store_true", help="print full markdown for any failing check")
     parser.add_argument(
+        "--only",
+        metavar="TEXT",
+        help="run only the checks whose name contains TEXT (case-insensitive); implies --full for slow ones",
+    )
+    parser.add_argument(
+        "--timeout-factor",
+        type=float,
+        default=1.0,
+        metavar="N",
+        help="multiply every check's conversion timeout by N (slow Docling checks time out on a loaded machine)",
+    )
+    parser.add_argument(
         "--dev",
         action="store_true",
         help="use build/python-runtime + engine/convert_driver.py instead of the built .app (tests what the next build will contain)",
@@ -477,8 +490,14 @@ def main() -> int:
     sys.path.insert(0, str(PROJECT_ROOT / "engine"))
     from convert_driver import _estimate_hebrew_fraction
 
-    checks = [c for c in CHECKS if args.full or not c.slow]
-    skipped = len(CHECKS) - len(checks)
+    checks = [c for c in CHECKS if args.full or args.only or not c.slow]
+    if args.only:
+        checks = [c for c in checks if args.only.lower() in c.name.lower()]
+        if not checks:
+            sys.exit(f"ERROR: no check name contains {args.only!r}")
+    if args.timeout_factor != 1.0:
+        checks = [replace(c, timeout=int(c.timeout * args.timeout_factor)) for c in checks]
+    skipped = len(CHECKS) - len(checks) if not args.only else 0
 
     print(f"Running {len(checks)} regression check(s) against {python_bin}")
     if skipped:
