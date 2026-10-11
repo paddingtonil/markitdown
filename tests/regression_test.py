@@ -354,6 +354,24 @@ CHECKS: list[Check] = [
         timeout=120,
     ),
     Check(
+        name="Hebrew page with a Hebrew-English table -- column order, escaped pipe",
+        # A ruled table whose middle column is English, so most of the
+        # table's letters are Latin while the page is Hebrew. The column
+        # order used to follow the table's own share of Hebrew letters: this
+        # one came out left column first (`| הערות | English | מונחים |`).
+        # One cell holds `A|B`, which used to split the row into four cells.
+        synthetic_fixture="hebrew_mixed_table.pdf",
+        must_contain=[
+            "| מונחים     | English                        | הערות |\n"
+            "| ---------- | ------------------------------ | ----- |\n"
+            "| צמחים      | Photosynthesis in green plants | A\\|B  |\n"
+            "| נשימת תאים | Cellular respiration process   | 2024  |\n"
+            "| מחזור המים | Evaporation and condensation   | תהליך |",
+        ],
+        expect_needs_confirmation=False,
+        min_length=300,
+    ),
+    Check(
         name="Hebrew text with reversed brackets -- must land in Needs review",
         # Correct Hebrew, so the orthography rate is silent, but every
         # parenthesis is back to front and the Latin word sits on the wrong
@@ -635,6 +653,34 @@ def check_no_cloud_transcription(python_bin: Path) -> tuple[str, list[str]]:
     return "PASS", []
 
 
+_TABLE_RENDERING_PROBE = r"""
+import markitdown.converters._pdf_converter as c
+# Vowel points take no width: both rows must be padded to the same width.
+print(c._render_markdown_table([["מילה", "x"], ["דָּג", "y"]]))
+# A grid of numbers has no letters of its own; it follows its page, and the
+# document when the page has too few letters to say.
+grid = [["1", "2"], ["3", "4"]]
+print(c._table_reads_rtl(grid, (300, 320), (0, 0)), c._table_reads_rtl(grid, (10, 300), (0, 0)),
+      c._table_reads_rtl(grid, (3, 5), (900, 1000)), c._table_reads_rtl(grid, (50, 100), (100, 1000)))
+# A table in one script answers for itself whatever the page says.
+print(c._table_reads_rtl([["Name", "Qty"]], (300, 320), (300, 320)), c._table_reads_rtl([["שם", "כמות"]], (0, 300), (0, 300)))
+"""
+_TABLE_RENDERING_EXPECTED = (
+    "| מילה | x   |\n| ---- | --- |\n| דָּג   | y   |\nTrue False True False\nFalse True\n"
+)
+
+
+def check_table_rendering(python_bin: Path) -> tuple[str, list[str]]:
+    proc = subprocess.run(
+        [str(python_bin), "-I", "-B", "-c", _TABLE_RENDERING_PROBE], capture_output=True, text=True, timeout=120
+    )
+    if proc.returncode != 0:
+        return "FAIL", [f"probe failed: {proc.stderr.strip()[-300:]}"]
+    if proc.stdout != _TABLE_RENDERING_EXPECTED:
+        return "FAIL", [f"expected {_TABLE_RENDERING_EXPECTED!r}", f"got      {proc.stdout!r}"]
+    return "PASS", []
+
+
 def check_docling_crash_falls_back(python_bin: Path, driver: Path) -> tuple[str, list[str]]:
     """
     A crash inside docling's native code must not fail the conversion: the
@@ -734,6 +780,14 @@ def main() -> int:
         inconclusive.append("Runtime has no cloud-transcription packages")
 
     if not args.only:
+        name = "Table rendering -- width without vowel points, direction of mixed and number-only tables"
+        status, notes = check_table_rendering(python_bin)
+        print(f"[{status}] {name}", flush=True)
+        for note in notes:
+            print(f"       {note}", flush=True)
+        if status == "FAIL":
+            failed.append(name)
+
         name = "A crash inside docling falls back to markitdown"
         status, notes = check_docling_crash_falls_back(python_bin, driver)
         print(f"[{status}] {name}", flush=True)

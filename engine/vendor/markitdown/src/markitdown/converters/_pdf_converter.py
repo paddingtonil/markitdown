@@ -1,6 +1,7 @@
 import sys
 import io
 import re
+import unicodedata
 from typing import BinaryIO, Any
 
 from .._base_converter import DocumentConverter, DocumentConverterResult
@@ -40,36 +41,133 @@ def _strip_pua(text: str) -> str:
 def _is_hebrew_dominant(text: str) -> bool:
     """
     True when at least half of `text`'s alphabetic characters are Hebrew.
-    Used to decide whether a table's column order should be reversed --
-    see `_reverse_rtl_table_columns` -- since Markdown tables always
-    render columns in the literal left-to-right order they're written in
-    the source, with no renderer reversing that for RTL content.
     """
     if not _RTL_CHAR_PATTERN.search(text):
         return False
-    hebrew_chars = sum(len(m.group(0)) for m in _HEBREW_WORD_PATTERN.finditer(text))
-    alpha_chars = sum(1 for ch in text if ch.isalpha())
+    hebrew_chars, alpha_chars = _letter_counts(text)
     return bool(alpha_chars) and hebrew_chars / alpha_chars >= 0.5
 
 
-def _reverse_rtl_table_columns(table_data: list[list[str]]) -> list[list[str]]:
+def _letter_counts(text: str) -> tuple[int, int]:
+    """(Hebrew letters, all letters) in `text`."""
+    hebrew_chars = sum(len(m.group(0)) for m in _HEBREW_WORD_PATTERN.finditer(text))
+    return hebrew_chars, sum(1 for ch in text if ch.isalpha())
+
+
+# Letter counts of the page being extracted and of all pages so far, as
+# (Hebrew, all). `convert` resets and fills them; the table direction is
+# read from them once the whole document has been counted.
+_page_letter_counts = [0, 0]
+_document_letter_counts = [0, 0]
+
+# Tables found while extracting, kept in the physical left-to-right column
+# order: (rows, letter counts of the table's page, sparse). Each leaves a
+# `_TABLE_TOKEN_PATTERN` line in the page's text, which
+# `_resolve_deferred_tables` replaces at the end of the document.
+_pending_tables: list[tuple[list[list[str]], tuple[int, int], bool]] = []
+_TABLE_TOKEN_PATTERN = re.compile("(\n?)\x00table:(\\d+)\x00(\n?)")
+
+# A context (page or document) with fewer letters than this has no say.
+_MIN_CONTEXT_LETTERS = 20
+
+
+def _table_reads_rtl(
+    rows: list[list[str]],
+    page_counts: tuple[int, int],
+    document_counts: tuple[int, int],
+) -> bool:
     """
-    Reverses each row's cell order when the table's content is
-    Hebrew-dominant. Markdown tables always render columns in the literal
-    left-to-right order they're written in the source -- no renderer
-    reverses column order for RTL content, even though every cell's text
-    reads RTL internally -- so the physically-rightmost column (logically
-    the *first* one to a Hebrew reader, e.g. a lone bullet-marker column
-    that visually belongs on the right) needs to become the first column
-    in the emitted Markdown, or the table reads back-to-front even though
-    every individual cell's text is correct.
+    Whether a table's columns run right to left, i.e. whether the
+    physically rightmost column is the first one to the reader. Markdown
+    has no direction of its own: a renderer lays the columns out in source
+    order, starting from the right in a right-to-left document, so the
+    first column the reader meets must be written first.
+
+    A table whose letters are all Hebrew, or all non-Hebrew, answers for
+    itself. A mixed table (an English term beside its Hebrew translation)
+    or one with no letters at all (a grid of numbers) does not: the share
+    of Hebrew letters in it says which language has the longer words, not
+    which way the page runs, and two tables of one document could come out
+    in opposite orders. Those follow the page when it is clearly of one
+    direction, and the document otherwise.
     """
-    if not table_data:
-        return table_data
-    all_cell_text = " ".join(cell or "" for row in table_data for cell in row)
-    if not _is_hebrew_dominant(all_cell_text):
-        return table_data
-    return [list(reversed(row)) for row in table_data]
+    hebrew, letters = _letter_counts(" ".join(cell for row in rows for cell in row))
+    if letters and hebrew == letters:
+        return True
+    if letters and not hebrew:
+        return False
+    page_hebrew, page_letters = page_counts
+    if page_letters >= _MIN_CONTEXT_LETTERS:
+        share = page_hebrew / page_letters
+        if share >= 0.7 or share <= 0.3:
+            return share >= 0.7
+    document_hebrew, document_letters = document_counts
+    if document_letters >= _MIN_CONTEXT_LETTERS:
+        return document_hebrew / document_letters >= 0.5
+    return bool(letters) and hebrew / letters >= 0.5
+
+
+def _display_width(text: str) -> int:
+    """
+    Number of character cells `text` occupies: vowel points, cantillation
+    and direction marks take none.
+    """
+    return sum(1 for ch in text if unicodedata.category(ch) not in ("Mn", "Me", "Cf"))
+
+
+def _render_markdown_table(rows: list[list[str]]) -> str:
+    """
+    Formats rows (the first is the header) as a Markdown table. A `|`
+    inside a cell is escaped, or it would end the cell there.
+    """
+    if not rows:
+        return ""
+    num_cols = max(len(row) for row in rows)
+    cells = [
+        [row[i].replace("|", "\\|") if i < len(row) else "" for i in range(num_cols)]
+        for row in rows
+    ]
+    widths = [max(3, max(_display_width(row[i]) for row in cells)) for i in range(num_cols)]
+
+    def fmt(row: list[str]) -> str:
+        padded = (cell + " " * (widths[i] - _display_width(cell)) for i, cell in enumerate(row))
+        return "| " + " | ".join(padded) + " |"
+
+    lines = [fmt(cells[0]), "| " + " | ".join("-" * width for width in widths) + " |"]
+    lines += [fmt(row) for row in cells[1:]]
+    return "\n".join(lines)
+
+
+def _defer_table(rows: list[list[str]], sparse: bool = False) -> str:
+    """
+    Registers a table (rows in physical left-to-right column order) and
+    returns the line that stands for it until the document's direction is
+    known. `sparse` marks a nearly empty grid, written as plain lines of
+    its filled cells instead of a table.
+    """
+    _pending_tables.append((rows, (_page_letter_counts[0], _page_letter_counts[1]), sparse))
+    return f"\x00table:{len(_pending_tables) - 1}\x00"
+
+
+def _resolve_deferred_tables(markdown: str) -> str:
+    document_counts = (_document_letter_counts[0], _document_letter_counts[1])
+
+    def render(match: "re.Match[str]") -> str:
+        before, index, after = match.groups()
+        rows, page_counts, sparse = _pending_tables[int(index)]
+        if _table_reads_rtl(rows, page_counts, document_counts):
+            rows = [list(reversed(row)) for row in rows]
+        if sparse:
+            filled = ([cell for cell in row if cell.strip()] for row in rows)
+            text = "\n".join(" ".join(row) for row in filled if row)
+        else:
+            text = _render_markdown_table(rows)
+        if text:
+            return before + text + after
+        # Nothing to write: drop the line the token stood on.
+        return before if after else ""
+
+    return _TABLE_TOKEN_PATTERN.sub(render, markdown)
 
 
 # Hebrew final letter forms and their regular (non-final) counterparts.
@@ -1592,15 +1690,7 @@ def _markdown_table_from_cells(rows: list[list[str | None]]) -> str:
     fixed_flat = _fix_hebrew_extraction("\n".join(flat), tidy=True).split("\n")
     fixed_it = iter(fixed_flat)
     cleaned = [[next(fixed_it) for _ in range(num_cols)] for _ in raw]
-    cleaned = _reverse_rtl_table_columns(cleaned)
-    col_widths = [max(3, max(len(row[i]) for row in cleaned)) for i in range(num_cols)]
-
-    def fmt(row: list[str]) -> str:
-        return "| " + " | ".join(cell.ljust(col_widths[i]) for i, cell in enumerate(row)) + " |"
-
-    lines = [fmt(cleaned[0]), "|" + "|".join("-" * (w + 2) for w in col_widths) + "|"]
-    lines += [fmt(row) for row in cleaned[1:]]
-    return "\n".join(lines)
+    return _defer_table(cleaned)
 
 
 def _extract_page_with_line_tables(page: Any) -> str | None:
@@ -1933,9 +2023,6 @@ def _extract_form_content_from_words(page: Any) -> str | None:
                 cells = extract_cells(row_info[table_idx])
                 table_data.append(cells)
 
-            table_data = _reverse_rtl_table_columns(table_data)
-
-            # Calculate column widths for this table
             if table_data:
                 total_cells = sum(len(row) for row in table_data)
                 filled_cells = sum(
@@ -1958,47 +2045,9 @@ def _extract_form_content_from_words(page: Any) -> str | None:
                     # "x" mark) as plain text, dropping empty rows entirely
                     # -- a real, denser grid full of X's/answers stays well
                     # above this threshold and still renders as a table.
-                    for row in table_data:
-                        non_empty = [cell for cell in row if cell.strip()]
-                        if non_empty:
-                            result_lines.append(" ".join(non_empty))
+                    result_lines.append(_defer_table(table_data, sparse=True))
                 else:
-                    col_widths = [
-                        max(len(row[col]) for row in table_data)
-                        for col in range(num_cols)
-                    ]
-                    # Ensure minimum width of 3 for separator dashes
-                    col_widths = [max(w, 3) for w in col_widths]
-
-                    # Format header row
-                    header = table_data[0]
-                    header_str = (
-                        "| "
-                        + " | ".join(
-                            cell.ljust(col_widths[i]) for i, cell in enumerate(header)
-                        )
-                        + " |"
-                    )
-                    result_lines.append(header_str)
-
-                    # Format separator row
-                    separator = (
-                        "| "
-                        + " | ".join("-" * col_widths[i] for i in range(num_cols))
-                        + " |"
-                    )
-                    result_lines.append(separator)
-
-                    # Format data rows
-                    for row in table_data[1:]:
-                        row_str = (
-                            "| "
-                            + " | ".join(
-                                cell.ljust(col_widths[i]) for i, cell in enumerate(row)
-                            )
-                            + " |"
-                        )
-                        result_lines.append(row_str)
+                    result_lines.append(_defer_table(table_data))
 
             idx = end  # Skip to end of table region
         else:
@@ -2176,6 +2225,8 @@ class PdfConverter(DocumentConverter):
             # keep memory usage constant regardless of page count.
             markdown_chunks: list[str] = []
             _document_bracket_votes[:] = [0, 0]
+            _document_letter_counts[:] = [0, 0]
+            _pending_tables.clear()
             form_page_count = 0
             # Pages laid out as columns of running text; see the engine
             # choice after the loop.
@@ -2199,6 +2250,11 @@ class PdfConverter(DocumentConverter):
                     try:
                         _mark_list_tabs(raw_page)
                         page = _drop_overlapped_spaces(raw_page)
+                        _page_letter_counts[:] = _letter_counts(
+                            "".join(c["text"] for c in page.chars)
+                        )
+                        _document_letter_counts[0] += _page_letter_counts[0]
+                        _document_letter_counts[1] += _page_letter_counts[1]
                         page_content = _extract_page_with_line_tables(page)
                         if page_content is None:
                             if _has_flowing_text_columns(page):
@@ -2261,6 +2317,11 @@ class PdfConverter(DocumentConverter):
             #   3-page document became 1,062 lines instead of 130). Nothing
             #   about such a file says so in advance, so the two results are
             #   compared: far more lines for the same text means fragments.
+            markdown_chunks = [
+                chunk
+                for chunk in map(_resolve_deferred_tables, markdown_chunks)
+                if chunk.strip()
+            ]
             page_markdown = "\n\n".join(markdown_chunks).strip()
             if form_page_count == 0 and column_page_count == 0:
                 pdf_bytes.seek(0)
