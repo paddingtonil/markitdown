@@ -158,7 +158,165 @@ def _hebrew_line_score(line: str) -> tuple[int, int]:
     return (_hebrew_orthography_violations(line), -_hebrew_common_word_hits(line))
 
 
-def _hebrew_line_candidates(line: str) -> list[tuple[str, bool, bool]]:
+def _unbalanced_brackets(lines: Any) -> int:
+    """Brackets left unmatched when `lines` are read in order as one text."""
+    depth = misses = 0
+    for line in lines:
+        for bracket in _BRACKET_RE.findall(line):
+            if bracket in _OPENING_BRACKETS:
+                depth += 1
+            elif depth:
+                depth -= 1
+            else:
+                misses += 1
+    return misses + depth
+
+
+# -- Visual order to reading order ------------------------------------------
+#
+# A line read off the page left to right (which is what pdfplumber returns
+# for every line, and what InDesign and browsers also write into the content
+# stream for Hebrew) is in VISUAL order. Running the Unicode Bidi Algorithm
+# over it once more turns it back into reading order, but only if the
+# algorithm is told the line's real direction. With a left-to-right base it
+# reverses each Hebrew run in place and keeps the runs where they were, so a
+# Hebrew sentence with one embedded Latin word or number came out with its
+# two halves exchanged: `כלי הבינה המלאכותית (AI) הביאו איתם` was emitted as
+# `הביאו איתם )AI( כלי הבינה המלאכותית`, `ב-AI.` as `AI-ב.`, and sentence
+# punctuation was stranded at the start of the line. A Hebrew-dominant line
+# is therefore resolved with a right-to-left base; a mostly-Latin line with a
+# few Hebrew words keeps the left-to-right base.
+#
+# Brackets need separate care, because the algorithm also MIRRORS them, and
+# whether that is right depends on how the PDF's producer recorded them.
+# InDesign and Word record the character that was typed (the bracket drawn
+# on the visual left of a Hebrew parenthesis is `)`), so reversing the line
+# already yields `(...)` and mirroring would break it. Producers that record
+# the glyph's shape need the mirroring. The two readings are told apart by
+# the brackets themselves: an opening bracket has to come before its closing
+# one. `_visual_to_logical` returns the unmirrored reading and
+# `_fix_hebrew_extraction` switches a line (or, by majority, a page) to the
+# mirrored one when that is the reading whose brackets pair up.
+_BRACKET_CHARS = "()[]{}<>«»"
+# Stand-ins the algorithm treats exactly like brackets (class ON) but has no
+# mirror image for, so a bracket swapped for one comes back unmirrored.
+_BRACKET_PLACEHOLDERS = "⌀⌁⌂⌃⌄⌅⌆⌇⌑⌒"
+_BRACKETS_TO_PLACEHOLDERS = str.maketrans(_BRACKET_CHARS, _BRACKET_PLACEHOLDERS)
+_PLACEHOLDERS_TO_BRACKETS = str.maketrans(_BRACKET_PLACEHOLDERS, _BRACKET_CHARS)
+_BRACKET_RE = re.compile(r"[()\[\]{}<>«»]")
+_PLACEHOLDER_RE = re.compile("[" + _BRACKET_PLACEHOLDERS + "]")
+_OPENING_BRACKETS = "([{<«"
+
+# Bracket-convention evidence from the pages of the document being converted
+# so far, as [typed-character votes, glyph-shape votes]. A page with a single
+# unpaired bracket has no evidence of its own and borrows the document's.
+# Reset at the start of every PDF conversion.
+_document_bracket_votes = [0, 0]
+
+
+# A Latin run at the visual left end of a right-to-left line (the line's
+# logical end) with a comma on its RIGHT, before the Hebrew: in a
+# right-to-left line a comma that followed the run would sit on its left, so
+# this one can only be inside a left-to-right run that carries on to the next
+# line (`Google Scholar,` / `SciSpace`). A left-to-right mark after it keeps
+# it with the run.
+_LATIN_RUN_THEN_PUNCT_RE = re.compile(r"^([A-Za-z][A-Za-z0-9 .\-]*[A-Za-z0-9][,;:])(?=\s+\S)")
+_LRM = "\u200e"
+
+
+def _is_rtl_line(line: str, rtl_context: bool) -> bool:
+    """
+    Whether a line containing Hebrew is a right-to-left line. Mostly-Hebrew
+    lines are. On a page that is itself mostly Hebrew the bar is lower, a
+    quarter of the letters: `Google Scholar-חיפוש ממוקד ב` has more Latin
+    letters than Hebrew ones and is still a Hebrew list item, whereas an
+    English sentence quoting one Hebrew word is not.
+    """
+    if _is_hebrew_dominant(line):
+        return True
+    if not rtl_context:
+        return False
+    hebrew = sum(len(m.group(0)) for m in _HEBREW_WORD_PATTERN.finditer(line))
+    alpha = sum(1 for ch in line if ch.isalpha())
+    return bool(alpha) and hebrew / alpha >= 0.25
+
+
+def _visual_to_logical(
+    line: str,
+    mirror_brackets: bool = False,
+    rtl_context: bool = False,
+    force_rtl: bool = False,
+) -> str | None:
+    """
+    Reading-order text for a line extracted in visual order, or None when the
+    bidi library is missing. See the comment block above for the base
+    direction and for `mirror_brackets`; `rtl_context` says the surrounding
+    page is mostly Hebrew (see `_is_rtl_line`), and `force_rtl` is for a line
+    with no Hebrew at all that is known to sit in right-to-left text.
+    """
+    try:
+        from bidi.algorithm import get_display
+    except ImportError:
+        return None
+
+    if not force_rtl and not _is_rtl_line(line, rtl_context):
+        return get_display(line, base_dir="L")
+    line = _LATIN_RUN_THEN_PUNCT_RE.sub(lambda m: m.group(1) + _LRM, line)
+    if mirror_brackets or not _BRACKET_RE.search(line) or _PLACEHOLDER_RE.search(line):
+        return get_display(line, base_dir="R").replace(_LRM, "")
+    return (
+        get_display(line.translate(_BRACKETS_TO_PLACEHOLDERS), base_dir="R")
+        .translate(_PLACEHOLDERS_TO_BRACKETS)
+        .replace(_LRM, "")
+    )
+
+
+# Niqqud and cantillation marks. A mark is extracted after the letter it sits
+# on, so reversing a line puts it before that letter, where it attaches to
+# whatever came before: `מֵעבר` came out with its tsere stranded in front of
+# the word. A word that starts with a mark is the sign of it, and then every
+# mark in that word is one letter early. Decided word by word: on one real
+# line `וּמטבע` was already right while `ְונשים` beside it was not.
+_HEBREW_MARKS = "\u0591-\u05bd\u05bf\u05c1\u05c2\u05c4\u05c5\u05c7"
+_MARK_INITIAL_WORD_RE = re.compile(
+    r"(?<![א-ת" + _HEBREW_MARKS + r"])[" + _HEBREW_MARKS + r"]+[א-ת][א-ת" + _HEBREW_MARKS + r"]*"
+)
+_MARKS_BEFORE_LETTER_RE = re.compile(r"([" + _HEBREW_MARKS + r"]+)([א-ת])")
+
+
+def _reattach_hebrew_marks(line: str) -> str:
+    return _MARK_INITIAL_WORD_RE.sub(
+        lambda m: _MARKS_BEFORE_LETTER_RE.sub(r"\2\1", m.group(0)), line
+    )
+
+
+# A line with no Hebrew in it, inside right-to-left text, that starts with
+# closing punctuation: `.)SciSpace` is the end of a Hebrew sentence whose last
+# word is Latin, read off the page left to right.
+_LATIN_LINE_IN_RTL_RE = re.compile(r"^(?:[.,:;!?]+[()\[\]]?|[)\]])\s*[A-Za-z]")
+
+
+def _bracket_order(line: str) -> int:
+    """
+    +1 when the line's first bracket opens and its last one closes, -1 when
+    it is the other way round, 0 when there is nothing to judge by (fewer
+    than two brackets, or a mix such as a `1)` list marker).
+    """
+    brackets = _BRACKET_RE.findall(line)
+    if len(brackets) < 2:
+        return 0
+    first_opens = brackets[0] in _OPENING_BRACKETS
+    last_opens = brackets[-1] in _OPENING_BRACKETS
+    if first_opens and not last_opens:
+        return 1
+    if last_opens and not first_opens:
+        return -1
+    return 0
+
+
+def _hebrew_line_candidates(
+    line: str, rtl_context: bool = False
+) -> list[tuple[str, bool, bool]]:
     """
     Builds up to four renderings of a single line -- (text, was_flipped,
     was_swapped) -- to handle two independent PDF-extraction bugs that
@@ -184,12 +342,9 @@ def _hebrew_line_candidates(line: str) -> list[tuple[str, bool, bool]]:
     are still swap-corrupted, can throw off the order decision itself.
     """
     candidates = [(line, False, False)]
-    try:
-        from bidi.algorithm import get_display
-
-        candidates.append((get_display(line, base_dir="L"), True, False))
-    except ImportError:
-        pass
+    flipped = _visual_to_logical(line, rtl_context=rtl_context)
+    if flipped is not None:
+        candidates.append((_reattach_hebrew_marks(flipped), True, False))
     candidates += [
         (text.translate(_LAMED_MEM_SWAP_TABLE), flipped, True)
         for text, flipped, _swapped in list(candidates)
@@ -224,6 +379,7 @@ _REFERENCE_WORD_RE = re.compile(
 _DOT_LEADER_RE = re.compile(r"(?<=\S)\s*(?:\.\s*){4,}(?=\s*\S)")
 _BULLET_GLYPHS = ("•", "●", "▪")
 _TRAILING_BULLET_RE = re.compile(r"\s[•●▪]\s*$")
+_SPACE_BEFORE_FINAL_PUNCT_RE = re.compile(r"(?<=\S)\s+(?=[.,:;!?]$)")
 
 
 def _tidy_reordered_hebrew_line(line: str) -> str:
@@ -239,7 +395,14 @@ def _tidy_reordered_hebrew_line(line: str) -> str:
         return line
 
     bullet = False
-    if _TRAILING_BULLET_RE.search(line):
+    if line.startswith("\t") and line.strip():
+        # InDesign separates an automatic list number or bullet from its item
+        # with a tab, and draws the number itself as a vector outline, which
+        # leaves no text. The tab (first on the line once it is in reading
+        # order) is all that says "list item", so it becomes a Markdown one;
+        # the number cannot be recovered and is not guessed.
+        line, bullet = line.strip(), True
+    elif _TRAILING_BULLET_RE.search(line):
         line, bullet = _TRAILING_BULLET_RE.sub("", line).strip(), True
     elif line.lstrip().startswith(tuple(glyph + " " for glyph in _BULLET_GLYPHS)):
         line, bullet = line.lstrip()[2:], True
@@ -260,6 +423,7 @@ def _tidy_reordered_hebrew_line(line: str) -> str:
 
     if _DOT_LEADER_RE.search(line):
         line = _DOT_LEADER_RE.sub(" … ", line).strip()
+    line = _SPACE_BEFORE_FINAL_PUNCT_RE.sub("", line)
     return "- " + line if bullet else line
 
 
@@ -346,6 +510,7 @@ def _fix_hebrew_extraction(
         return text
 
     lines = text.split("\n")
+    rtl_context = _is_hebrew_dominant(text)
     decided: list[str | None] = []
     pending_candidates: list[list[tuple[str, bool, bool]] | None] = []
     flip_votes: list[bool] = []
@@ -354,15 +519,17 @@ def _fix_hebrew_extraction(
     # lines get `_tidy_reordered_hebrew_line`, since the artifact it repairs
     # comes from the flip.
     was_flipped: list[bool] = []
+    was_swapped: list[bool] = []
 
     for line in lines:
         if not _RTL_CHAR_PATTERN.search(line):
             decided.append(line)
             pending_candidates.append(None)
             was_flipped.append(False)
+            was_swapped.append(False)
             continue
 
-        candidates = _hebrew_line_candidates(line)
+        candidates = _hebrew_line_candidates(line, rtl_context)
         original_score = _hebrew_line_score(line)
         is_decisive = any(
             _hebrew_line_score(c) != original_score for c, _f, _s in candidates
@@ -381,20 +548,45 @@ def _fix_hebrew_extraction(
                 candidates, key=lambda c: _hebrew_line_score(c[0])
             )
             decided.append(best_text)
-            pending_candidates.append(None)
             was_flipped.append(flipped)
+            was_swapped.append(swapped)
+            # A verdict resting on a single function-word match, with the
+            # orthography count level, is weak: `.אבה בלשל` (mirrored
+            # `לשלב הבא.`) "contains" the word `של` once two prefix letters
+            # are stripped, and that alone kept it mirrored on a page where
+            # every other line was flipped. A weak verdict still votes (on a
+            # page of short labels there is nothing else), but gives way to
+            # the page's majority when it turns out to disagree with it.
+            best_score = _hebrew_line_score(best_text)
+            runner_up = min(
+                _hebrew_line_score(c)
+                for c, f, s in candidates
+                if (f, s) != (flipped, swapped)
+            )
+            if best_score[0] == runner_up[0] and runner_up[1] - best_score[1] <= 1:
+                pending_candidates.append(candidates)
+            else:
+                pending_candidates.append(None)
             flip_votes.append(flipped)
             swap_votes.append(swapped)
         else:
             decided.append(None)
             pending_candidates.append(candidates)
             was_flipped.append(False)
+            was_swapped.append(False)
 
     flip_majority = bool(flip_votes) and sum(flip_votes) > len(flip_votes) / 2
     swap_majority = bool(swap_votes) and sum(swap_votes) > len(swap_votes) / 2
 
+    # A weak verdict (see above) is overruled only by a clear majority; in a
+    # block of two or three short cells the "majority" is no better informed
+    # than the line itself.
+    flips = sum(flip_votes)
+    clear_majority = abs(2 * flips - len(flip_votes)) >= 3
     for i, candidates in enumerate(pending_candidates):
         if candidates is None:
+            continue
+        if decided[i] is not None and not clear_majority:
             continue
         chosen = next(
             (
@@ -405,6 +597,73 @@ def _fix_hebrew_extraction(
             None,
         )
         decided[i], was_flipped[i] = chosen if chosen is not None else (lines[i], False)
+        was_swapped[i] = chosen is not None and swap_majority
+
+    # Brackets: each flipped line was built unmirrored (see
+    # `_visual_to_logical`). Lines whose brackets only pair up in the
+    # mirrored reading vote for it; a line with no evidence of its own
+    # follows the page, and a page with none follows the document so far.
+    mirrored: dict[int, str] = {}
+    line_verdicts: dict[int, int] = {}
+    for i, flipped in enumerate(was_flipped):
+        if not flipped or not _BRACKET_RE.search(decided[i]):  # type: ignore[arg-type]
+            continue
+        alternative = _visual_to_logical(
+            lines[i], mirror_brackets=True, rtl_context=rtl_context
+        )
+        if alternative is None:
+            continue
+        alternative = _reattach_hebrew_marks(alternative)
+        if alternative == decided[i]:
+            continue
+        if was_swapped[i]:
+            alternative = alternative.translate(_LAMED_MEM_SWAP_TABLE)
+        mirrored[i] = alternative
+        plain_order = _bracket_order(decided[i])  # type: ignore[arg-type]
+        mirrored_order = _bracket_order(alternative)
+        if plain_order > 0 and mirrored_order <= 0:
+            line_verdicts[i] = 0
+        elif mirrored_order > 0 and plain_order <= 0:
+            line_verdicts[i] = 1
+    # The page as a whole: read in order, brackets must open before they
+    # close, across lines too. A parenthesis that wraps (`(כיתות ה'-ו' ...` /
+    # `... מותאמת).`) has one bracket on each line and no line to judge by,
+    # and one such page turned out to use the other convention from the rest
+    # of its document (a back cover made separately).
+    page_votes = [
+        sum(1 for v in line_verdicts.values() if v == 0),
+        sum(1 for v in line_verdicts.values() if v == 1),
+    ]
+    if mirrored:
+        plain_misses = _unbalanced_brackets(decided[i] for i in sorted(mirrored))  # type: ignore[misc]
+        mirrored_misses = _unbalanced_brackets(mirrored[i] for i in sorted(mirrored))
+        if plain_misses < mirrored_misses:
+            page_votes[0] += 1
+        elif mirrored_misses < plain_misses:
+            page_votes[1] += 1
+    _document_bracket_votes[0] += page_votes[0]
+    _document_bracket_votes[1] += page_votes[1]
+    if page_votes[0] != page_votes[1]:
+        page_mirrors = page_votes[1] > page_votes[0]
+    else:
+        page_mirrors = _document_bracket_votes[1] > _document_bracket_votes[0]
+    for i, alternative in mirrored.items():
+        if line_verdicts.get(i, int(page_mirrors)) == 1:
+            decided[i] = alternative
+
+    # A Latin-only line inside flipped Hebrew text (see
+    # `_LATIN_LINE_IN_RTL_RE`), with the page's bracket convention.
+    if flip_majority and rtl_context:
+        for i, line in enumerate(lines):
+            if (
+                not _RTL_CHAR_PATTERN.search(line)
+                and _LATIN_LINE_IN_RTL_RE.match(line.strip())
+            ):
+                reordered = _visual_to_logical(
+                    line.strip(), mirror_brackets=page_mirrors, force_rtl=True
+                )
+                if reordered is not None:
+                    decided[i] = reordered
 
     if tidy:
         decided = [
@@ -702,7 +961,14 @@ def _detect_column_gutter(page: Any, min_gutter_pt: float = 8.0) -> tuple[float,
     if not page.chars:
         return None
 
-    width = page.width
+    # Measured within the region itself. `page` is often a crop, and a crop
+    # reports absolute page coordinates, so comparing a gap's absolute
+    # midpoint with a fraction of the crop's own width rejected every gutter
+    # in a crop that does not start at the page's left edge: of three cards
+    # side by side, only the first split was ever found, and the other two
+    # were interleaved line by line.
+    region_x0 = page.bbox[0]
+    width = page.bbox[2] - region_x0
     intervals = sorted((c["x0"], c["x1"]) for c in page.chars)
     merged: list[tuple[float, float]] = []
     for x0, x1 in intervals:
@@ -714,12 +980,312 @@ def _detect_column_gutter(page: Any, min_gutter_pt: float = 8.0) -> tuple[float,
     best: tuple[float, float, float] | None = None  # (gap_width, prev_x1, next_x0)
     for (_prev_x0, prev_x1), (next_x0, _next_x1) in zip(merged, merged[1:]):
         gap = next_x0 - prev_x1
-        mid = (prev_x1 + next_x0) / 2
+        mid = (prev_x1 + next_x0) / 2 - region_x0
         if gap >= min_gutter_pt and width * 0.25 <= mid <= width * 0.75:
             if best is None or gap > best[0]:
                 best = (gap, prev_x1, next_x0)
 
     return (best[1], best[2]) if best else None
+
+
+_PROSE_WORD_RE = re.compile(r"[^\W\d_]{2,}")
+
+
+def _column_side_stats(chars: list[dict]) -> tuple[int, float, float, float]:
+    """
+    (line count, share of lines that are prose, top, bottom) for one side of
+    a gutter. A prose line has at least three words of two or more letters:
+    digits, lone letters and symbols do not count, so rows of sums, answer
+    marks or blanks are never prose however many of them a line holds.
+    """
+    lines: dict[int, list[dict]] = {}
+    for c in chars:
+        lines.setdefault(round(c["top"] / 2), []).append(c)
+    if not lines:
+        return 0, 0.0, 0.0, 0.0
+    prose = sum(
+        1
+        for line in lines.values()
+        if len(
+            _PROSE_WORD_RE.findall(
+                "".join(c["text"] for c in sorted(line, key=lambda c: c["x0"]))
+            )
+        )
+        >= 3
+    )
+    return (
+        len(lines),
+        prose / len(lines),
+        min(c["top"] for c in chars),
+        max(c["bottom"] for c in chars),
+    )
+
+
+def _is_flowing_text_columns(
+    region: Any,
+    gutter: tuple[float, float],
+    min_lines: int = 3,
+    min_prose_share: float = 0.5,
+    min_height_fraction: float = 0.6,
+) -> bool:
+    """
+    True when both sides of `gutter` hold running text: several lines each,
+    at least half of them prose (see `_column_side_stats`), each side
+    covering most of the region's height.
+
+    A gutter alone does not say what it separates. Between two columns of
+    prose the sides are independent and each must be read top to bottom;
+    between the columns of a form or table (label and value, name and
+    number) each line belongs with the line beside it. Words per line is
+    what tells them apart: prose fills its column, cells hold a word or two.
+    The height condition excludes a block that merely sits beside part of
+    the text, such as one card under a full-width heading.
+
+    A gutter with a ruling drawn down it is a table's column border, never a
+    gap between columns of prose, whatever its cells contain: a curriculum's
+    rubric tables have whole paragraphs in every cell. Only thin strokes
+    count, and they count a little outside the gap as well, since cell text
+    can run up to its border. The edge of a wide filled shape (the card each
+    text frame sits on) also falls inside the gutter and says nothing of the
+    kind.
+    """
+    left_end, right_start = gutter
+    chars = region.chars
+    non_blank = [c for c in chars if c["text"].strip()]
+    if not non_blank:
+        return False
+    height = max(c["bottom"] for c in non_blank) - min(c["top"] for c in non_blank)
+    ruled = sum(
+        obj["bottom"] - obj["top"]
+        for obj in list(region.lines) + list(region.rects)
+        if obj["x1"] - obj["x0"] <= 2.0
+        and obj["x0"] >= left_end - 10.0
+        and obj["x1"] <= right_start + 10.0
+    )
+    if ruled >= 0.5 * height:
+        return False
+    for side in (
+        [c for c in chars if c["x1"] <= left_end + 0.01],
+        [c for c in chars if c["x0"] >= right_start - 0.01],
+    ):
+        line_count, prose_share, top, bottom = _column_side_stats(side)
+        if (
+            line_count < min_lines
+            or prose_share < min_prose_share
+            or bottom - top < min_height_fraction * height
+        ):
+            return False
+    return True
+
+
+def _page_reads_as_columns(page: Any, bands: list[tuple[float, float]]) -> bool:
+    """
+    True when the whole page is two columns of running text that must each
+    be read to the end before the other -- as opposed to a page whose row
+    bands are each to be read across.
+
+    Row bands are found first by default, because a full-width headline
+    hides the gutter of the columns below it. That default breaks a page of
+    two independent text frames whose paragraphs happen to start at the same
+    heights: every shared paragraph gap becomes a band boundary, and the
+    page comes out as heading, heading, paragraph, paragraph. So when a
+    gutter runs the full height of the page between two sides of running
+    text, and each side has at least twice as many lines as the page has
+    bands (the bands are paragraphs, not the rows of a grid), the columns
+    are split first.
+    """
+    gutter = _detect_column_gutter(page)
+    if gutter is None or not _is_flowing_text_columns(page, gutter):
+        return False
+    left_end, right_start = gutter
+    left_lines = _column_side_stats([c for c in page.chars if c["x1"] <= left_end + 0.01])[0]
+    right_lines = _column_side_stats([c for c in page.chars if c["x0"] >= right_start - 0.01])[0]
+    return min(left_lines, right_lines) >= 2 * len(bands)
+
+
+def _join_column_bands(
+    page: Any, bands: list[tuple[float, float]], max_gap_pt: float = 24.0
+) -> list[tuple[float, float]]:
+    """
+    Joins consecutive row bands that are really one set of columns: each has
+    a gutter in the same place, they are less than `max_gap_pt` apart, and
+    the joined region is columns of running text (the same test as
+    `_page_reads_as_columns`, within the region).
+
+    This is a column heading sitting a little above its text. The gap under
+    a large heading is enough to start a new band, so two cards side by side
+    came out as heading, heading, text, text. The distance limit keeps a
+    separate block further down the page -- a two-column list under the
+    cards, whose gutter happens to line up with theirs -- as a band of its
+    own.
+    """
+    if len(bands) < 2:
+        return bands
+    x0, _top, x1, _bottom = page.bbox
+    info = []
+    for top, bottom in bands:
+        band = page.crop((x0, top, x1, bottom))
+        inked = [c for c in band.chars if c["text"].strip()]
+        info.append(
+            (
+                _detect_column_gutter(band),
+                min((c["top"] for c in inked), default=top),
+                max((c["bottom"] for c in inked), default=bottom),
+            )
+        )
+
+    groups: list[list[int]] = [[0]]
+    for i in range(1, len(bands)):
+        gutter, text_top, _text_bottom = info[i]
+        prev_gutter, _prev_top, prev_bottom = info[i - 1]
+        if (
+            gutter is not None
+            and prev_gutter is not None
+            and min(gutter[1], prev_gutter[1]) - max(gutter[0], prev_gutter[0]) >= 8.0
+            and text_top - prev_bottom < max_gap_pt
+        ):
+            groups[-1].append(i)
+        else:
+            groups.append([i])
+
+    joined: list[tuple[float, float]] = []
+    for group in groups:
+        span = (bands[group[0]][0], bands[group[-1]][1])
+        if len(group) > 1:
+            region = page.crop((x0, span[0], x1, span[1]))
+            if _page_reads_as_columns(region, [bands[i] for i in group]):
+                joined.append(span)
+                continue
+        joined += [bands[i] for i in group]
+    return joined
+
+
+def _has_flowing_text_columns(page: Any) -> bool:
+    """
+    True when the page, or one of its row bands, is columns of running text.
+    Used to keep such a page away from the word-position table heuristic,
+    which sees two columns of prose plus a short list as a sparse table and
+    emits the two columns' lines side by side in one row.
+    """
+    bands = _detect_row_bands(page)
+    if _page_reads_as_columns(page, bands):
+        return True
+    if len(bands) < 2:
+        return False
+    x0, _top, x1, _bottom = page.bbox
+    for top, bottom in bands:
+        band = page.crop((x0, top, x1, bottom))
+        gutter = _detect_column_gutter(band)
+        if gutter is not None and _is_flowing_text_columns(band, gutter):
+            return True
+    return False
+
+
+# An item that already carries a bullet of its own needs no second one.
+_LIST_MARKER_CHARS = "·•●▪◦○■□-–—*"
+
+
+def _mark_list_tabs(page: Any) -> None:
+    """
+    Turns the tab that follows an automatic list number or bullet into a
+    bullet character, in place, so the item is still recognisable as one.
+
+    InDesign draws automatic numbers and bullets as vector outlines, which
+    leave no text behind; the only trace in the text layer is the tab
+    between the marker and its item. In a right-to-left list that tab is at
+    the item's right-hand end, with the text close on its left and nothing
+    close on its right, and only such tabs are converted: a tab between two
+    pieces of text is spacing, not a list marker. The numbers themselves are
+    not recoverable and are not invented -- every item becomes a plain
+    bullet.
+    """
+    tabs = [c for c in page.chars if c["text"] == "\t"]
+    if not tabs:
+        return
+    letters = [c for c in page.chars if c["text"].strip()]
+    for tab in tabs:
+        same_line = [
+            c for c in letters if c["top"] < tab["bottom"] and c["bottom"] > tab["top"]
+        ]
+        if not any(_RTL_CHAR_PATTERN.search(c["text"]) for c in same_line):
+            continue
+        right_gap = min(
+            (c["x0"] - tab["x1"] for c in same_line if c["x0"] >= tab["x1"] - 0.5),
+            default=float("inf"),
+        )
+        left_gap = min(
+            (tab["x0"] - c["x1"] for c in same_line if c["x1"] <= tab["x0"] + 0.5),
+            default=float("inf"),
+        )
+        nearest_left = max(
+            (c for c in same_line if c["x1"] <= tab["x0"] + 0.5),
+            key=lambda c: c["x1"],
+            default=None,
+        )
+        if (
+            right_gap > 15.0
+            and left_gap < 15.0
+            and nearest_left is not None
+            and nearest_left["text"] not in _LIST_MARKER_CHARS
+        ):
+            tab["text"] = "•"
+
+
+def _drop_overlapped_spaces(page: Any) -> Any:
+    """
+    Returns the page without space characters that sit inside another
+    character's box.
+
+    InDesign writes the space that ended a line of right-to-left text (the
+    one the line was broken at) on top of the line's last letter, which is
+    its leftmost. Read by position, that space lands between the last two
+    letters and splits the word: `רק` came out as `ר ק`, `שמורידה` as
+    `שמוריד ה`. A space has no extent of its own to protect, so one lying
+    inside a letter is not a word gap. "Inside" is 80% of its width: measured
+    on six documents, spaces are either under 30% covered (22,000 real ones)
+    or over 80% (the stray ones), with almost nothing between. Pages without such a space
+    are returned untouched.
+    """
+    spaces = [c for c in page.chars if c["text"] == " "]
+    if not spaces:
+        return page
+    letters_by_row: dict[int, list[dict]] = {}
+    for c in page.chars:
+        if c["text"].strip():
+            letters_by_row.setdefault(round(c["top"] / 4), []).append(c)
+    overlapped: set[tuple[float, float]] = set()
+    for space in spaces:
+        width = space["x1"] - space["x0"]
+        row = round(space["top"] / 4)
+        same_line = [
+            letter
+            for near in range(row - 3, row + 4)
+            for letter in letters_by_row.get(near, ())
+            if letter["top"] < space["bottom"] and letter["bottom"] > space["top"]
+        ]
+        if width > 0:
+            # By ONE letter. Adding up the letters on both sides was tried
+            # and removed real word gaps in a font whose letter boxes are
+            # wider than its glyphs (`הבעתעמדהאישית`).
+            is_overlapped = any(
+                min(space["x1"], c["x1"]) - max(space["x0"], c["x0"]) >= 0.8 * width
+                for c in same_line
+            )
+        else:
+            is_overlapped = any(
+                c["x0"] - 0.5 <= space["x0"] <= c["x1"] + 0.5 for c in same_line
+            )
+        if is_overlapped:
+            overlapped.add((space["x0"], space["top"]))
+    if not overlapped:
+        return page
+    return page.filter(
+        lambda obj: not (
+            obj.get("object_type") == "char"
+            and obj.get("text") == " "
+            and (obj["x0"], obj["top"]) in overlapped
+        )
+    )
 
 
 def _detect_sidebar_gutter(
@@ -885,7 +1451,8 @@ def _extract_region_text(region: Any, depth: int = 0, max_depth: int = 2) -> str
 
     Each column is read via pdfplumber's own `extract_text()` on the
     cropped region -- reusing its line-grouping rather than
-    reimplementing it -- and columns are joined left-to-right.
+    reimplementing it -- and columns are joined in reading order:
+    left-to-right, or right-to-left when the region's text is mostly Hebrew.
 
     A sidebar (`_detect_sidebar_gutter`) is split off only when there is
     no ordinary column gutter, and is the one exception to left-to-right:
@@ -913,7 +1480,12 @@ def _extract_region_text(region: Any, depth: int = 0, max_depth: int = 2) -> str
     right = region.crop((right_start, top, x1, bottom))
     left_text = _extract_region_text(left, depth + 1, max_depth)
     right_text = _extract_region_text(right, depth + 1, max_depth)
-    if narrow_side == "left":
+    # Columns are read in the direction of the text: right column first on a
+    # Hebrew page. A left sidebar also comes after the main text.
+    if narrow_side == "left" or (
+        narrow_side is None
+        and _is_hebrew_dominant("".join(c["text"] for c in region.chars))
+    ):
         return "\n\n".join(t for t in (right_text, left_text) if t)
     return "\n\n".join(t for t in (left_text, right_text) if t)
 
@@ -952,6 +1524,12 @@ def _extract_plain_page_text(page: Any) -> str | None:
     non-body-text pages are usually single-column) -- verified to
     produce byte-identical output to the pre-existing behavior on such
     pages before trusting this on real multi-column content.
+
+    Two exceptions to "bands first", both for columns of running text
+    whose paragraphs line up across the gutter: a page that is such
+    columns from top to bottom is split into columns straight away
+    (`_page_reads_as_columns`), and a heading band is joined to the
+    column band right under it (`_join_column_bands`).
     """
     bands = _detect_row_bands(page)
     if (
@@ -961,6 +1539,10 @@ def _extract_plain_page_text(page: Any) -> str | None:
     ):
         # No band signal, no column signal: identical to prior behavior.
         return page.extract_text()
+
+    if len(bands) > 1 and _page_reads_as_columns(page, bands):
+        return _extract_region_text(page) or None
+    bands = _join_column_bands(page, bands)
 
     page_x0, _page_top, page_x1, _page_bottom = page.bbox
     band_texts = [
@@ -1535,6 +2117,10 @@ def _extract_tables_from_words(page: Any) -> list[list[list[str]]]:
     return [table_rows]
 
 
+def _non_blank_line_count(text: str) -> int:
+    return sum(1 for line in text.split("\n") if line.strip())
+
+
 class PdfConverter(DocumentConverter):
     """
     Converts PDFs to Markdown.
@@ -1589,7 +2175,11 @@ class PdfConverter(DocumentConverter):
             # after each page to free pdfplumber's cached objects and
             # keep memory usage constant regardless of page count.
             markdown_chunks: list[str] = []
+            _document_bracket_votes[:] = [0, 0]
             form_page_count = 0
+            # Pages laid out as columns of running text; see the engine
+            # choice after the loop.
+            column_page_count = 0
             plain_page_indices: list[int] = []
             # Tracked independently of markdown_chunks because
             # markdown_chunks is discarded entirely below when no page
@@ -1604,12 +2194,18 @@ class PdfConverter(DocumentConverter):
             degraded_page_numbers: list[int] = []
 
             with pdfplumber.open(pdf_bytes) as pdf:
-                for page_idx, page in enumerate(pdf.pages):
+                for page_idx, raw_page in enumerate(pdf.pages):
+                    page = raw_page
                     try:
+                        _mark_list_tabs(raw_page)
+                        page = _drop_overlapped_spaces(raw_page)
                         page_content = _extract_page_with_line_tables(page)
                         if page_content is None:
-                            page_content = _extract_form_content_from_words(page)
-                        image_count = len(page.images)
+                            if _has_flowing_text_columns(page):
+                                column_page_count += 1
+                            else:
+                                page_content = _extract_form_content_from_words(page)
+                        image_count = len(raw_page.images)
                         if image_count > 0:
                             image_page_counts[page_idx + 1] = image_count
 
@@ -1651,17 +2247,32 @@ class PdfConverter(DocumentConverter):
                         except Exception:
                             pass  # this page's text is lost, but the rest of the document isn't
 
-                    page.close()  # Free cached page data immediately
+                    raw_page.close()  # Free cached page data immediately
 
             # If no pages had form-style content, use pdfminer for
-            # the whole document (better text spacing for prose).
-            if form_page_count == 0:
+            # the whole document (better text spacing for prose) -- unless
+            # the per-page text is the more trustworthy of the two:
+            #
+            # - a page was read as columns. pdfminer knows nothing of the
+            #   column order worked out above, so switching to it would
+            #   throw that away for the whole document;
+            # - pdfminer shatters the text. A PDF that positions every word
+            #   separately comes out of it one or two words to a line (a
+            #   3-page document became 1,062 lines instead of 130). Nothing
+            #   about such a file says so in advance, so the two results are
+            #   compared: far more lines for the same text means fragments.
+            page_markdown = "\n\n".join(markdown_chunks).strip()
+            if form_page_count == 0 and column_page_count == 0:
                 pdf_bytes.seek(0)
                 markdown = _fix_hebrew_page_text(
                     _strip_pua(pdfminer.high_level.extract_text(pdf_bytes))
                 )
+                if _non_blank_line_count(markdown) > 1.5 * _non_blank_line_count(
+                    page_markdown
+                ):
+                    markdown = page_markdown
             else:
-                markdown = "\n\n".join(markdown_chunks).strip()
+                markdown = page_markdown
 
         except Exception:
             # Fallback if pdfplumber fails

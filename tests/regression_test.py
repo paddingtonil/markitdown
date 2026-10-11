@@ -194,16 +194,28 @@ CHECKS: list[Check] = [
     Check(
         name="Reading-comprehension PDF -- bordered table, RTL column order",
         fixture="reading_comprehension_bordered_table.pdf",
-        max_violations=2,
+        # All three are the abbreviation ראמ"ה in the page header, which the
+        # counter splits at the gershayim. It used to come out mirrored
+        # (`ה"מאר`), which the counter happens not to object to.
+        max_violations=3,
         min_hebrew_fraction=0.5,
         must_contain=["הבנת הנקרא", "ארבעה ממדי הבנה"],
     ),
     Check(
         name="National pedagogy policy PDF -- title line tied between mirrored/unmirrored",
         fixture="national_pedagogy_policy_title_tie.pdf",
-        max_violations=20,  # measured baseline on the current code
+        # Measured baseline on the current code. One more than before the
+        # 2026-10-10 reordering fix: a heading that used to stay mirrored
+        # (`תשרומו ך"נת`) now reads `תנ"ך ומורשת`, and `תנ` is counted.
+        max_violations=21,
         min_hebrew_fraction=0.5,
-        must_contain=["דמות הבוגרת והבוגר. המדיניות הפדגוגית הלאומית"],
+        must_contain=[
+            "דמות הבוגרת והבוגר. המדיניות הפדגוגית הלאומית",
+            "תנ\"ך ומורשת",
+            # Mixed-direction lines: the Latin term between its two Hebrew
+            # halves, brackets the right way round.
+            "הללו הוא תנועה מתפיסה פדגוגית מסורתית (Instructionalist) לתפיסת למידה עדכנית.",
+        ],
         # The running-header title is made of proper nouns outside the
         # common-word list, so it scores identically mirrored and
         # unmirrored. The old decisiveness test still called it "decisive"
@@ -253,7 +265,11 @@ CHECKS: list[Check] = [
         external_path="/path/to/your/science-booklet.pdf",
         # Before the glyph-name fix this document came out as 313 violations
         # (8.9 per 1,000) of Hebrew letters mixed with ASCII punctuation.
-        max_violations=57,  # measured baseline on the current code
+        # Measured baseline on the current code. It rose from 57 when niqqud
+        # was put back on its letters: the counter splits a pointed word at
+        # each mark, so `מִינְיוּם` (17 times) yields a "word" `ינ`; the
+        # abbreviation סמ"ק, no longer mirrored, accounts for 3 more.
+        max_violations=73,
         min_hebrew_fraction=0.5,
         # Its Hebrew subset fonts carry a ToUnicode map built from the
         # character codes (33 -> "!", 48 -> "0" ...) while the glyph names
@@ -280,12 +296,73 @@ CHECKS: list[Check] = [
             r"[א-ת][#&][א-ת]",
             r"(?<![0-9A-Za-z])[#&][א-ת]{2,}",
             r"[א-ת]{2,}[#&](?![0-9A-Za-z])",
-            r"[א-ת]{3,}[0-9](?![0-9A-Za-z])",
+            # At the END of a word (`ארגו9`). One line of this booklet is two
+            # printed lines on top of each other, a list number among them,
+            # and a digit in the middle of that is not this bug.
+            r"[א-ת]{3,}[0-9](?![0-9A-Za-zא-ת])",
         ],
         # Also pins the "Needs review" gate: this document used to trip it,
         # and a regression of the font fix would trip it again.
         expect_needs_confirmation=False,
         timeout=180,
+    ),
+    Check(
+        name="InDesign booklet (26pp) -- mixed-direction lines, cards in columns, list tabs",
+        fixture="indesign_cards_mixed_direction.pdf",
+        max_violations=3,  # measured baseline on the current code
+        min_hebrew_fraction=0.5,
+        must_contain=[
+            # A Hebrew line with an embedded Latin word: the two halves used
+            # to be exchanged around it and the brackets mirrored
+            # (`הביאו איתם ... )AI( כלי הבינה המלאכותית`).
+            "כלי הבינה המלאכותית (AI) הביאו איתם מציאות חדשה בכיתה. אחד האתגרים הגדולים",
+            "אמיתיות בשימוש ב-AI.",
+            "#לשימוש מורה #כשירות AI: תפקוד אתי",
+            # More Latin letters than Hebrew ones, still a Hebrew line.
+            "חיפוש ממוקד ב-Google Scholar",
+            # A Latin-only line ending a Hebrew sentence (was `.)SciSpace`).
+            "ראשוניים בכלים ייעודיים (כגון Google Scholar,\nSciSpace).",
+            # Two cards side by side: each heading followed by its own text.
+            # Row bands used to cut across both (heading, heading, text, text)
+            # and the left card came first.
+            "1.1 קוד אתי\nהאתגר הפדגוגי\nתלמידים (וגם מורים) חווים",
+            "1.3 כלי עזר:\nמפת הסקרנות שלי\nהאתגר הפדגוגי\nתלמידים מתקשים לזהות",
+            # A heading a little above its column, on a page that used to be
+            # taken for a table and came out mirrored (`תורפס תריקס 2`).
+            'המטרה הפדגוגית\nלהילחם ישירות ב"אשליית',
+            # The space InDesign writes on top of a line's last letter.
+            "יצירת מסגרת עבודה ברורה ומוסכמת, שמורידה\n",
+            "אפשרות למשוב על תהליך החשיבה ולא רק\n",
+            # Automatic list numbers are vector outlines; the tab after them
+            # is what marks the item.
+            "- מקיימים דיון כיתתי מונחה סביב דילמות אתיות",
+            # Niqqud stays on its letter.
+            "- מֵעבר לחומת התשלום",
+            # A short line whose mirrored form "contains" a common word.
+            "לשלב הבא.",
+        ],
+        must_not_contain=["תורפס תריקס", ")AI(", "| ---"],
+        must_not_match=[
+            r"(?m)^\s*(?:- )?[.,:;!?]+\s*[א-ת]",
+            # Columns are read right to left: 1.1 before 1.2, 6.1 before 6.2.
+            r"(?s)1\.2 מסע חקר אישי.*1\.1 קוד אתי",
+            r"(?s)6\.2 איך זה מתחבר.*6\.1 מה הכי חשוב",
+            r"(?s)האתגר\nתלמידים נוטים “לקפוץ.*המטרה הפדגוגית\nלהעביר תלמידים",
+        ],
+        must_not_warn=["brackets back to front"],
+        expect_needs_confirmation=False,
+        timeout=120,
+    ),
+    Check(
+        name="Hebrew text with reversed brackets -- must land in Needs review",
+        # Correct Hebrew, so the orthography rate is silent, but every
+        # parenthesis is back to front and the Latin word sits on the wrong
+        # side of it: what mixed-direction lines looked like before
+        # `_visual_to_logical`. The standing positive case for that gate.
+        synthetic_fixture="hebrew_reversed_brackets.txt",
+        must_warn=["brackets back to front"],
+        must_not_warn=["orthography violations"],
+        expect_needs_confirmation=True,
     ),
     Check(
         name="Short Windows-1255 text file -- must not be decoded as Cyrillic",

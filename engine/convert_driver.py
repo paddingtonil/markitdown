@@ -11,7 +11,8 @@ validation pass over the result, then prints a single JSON object to stdout:
 `warnings` is empty when validation found nothing to flag. `needs_confirmation`
 is true only when the content looks unreliable enough (currently: a Hebrew
 orthography-violation rate far above this project's known-good baselines, or
-several lines with a symbol where a Hebrew letter should be, or OCR output
+several lines with a symbol where a Hebrew letter should be, or several Hebrew
+lines with their brackets back to front, or OCR output
 from a PDF without a text layer that does not read as text) that the caller
 should ask the user before treating the conversion as done,
 rather than just displaying a warning -- see `_validate`. On failure, prints
@@ -162,6 +163,32 @@ def _hebrew_symbol_substitution_lines(markdown: str) -> list[str]:
     ]
 
 
+# A Hebrew line whose brackets are back to front: the first one closes and
+# the last one opens, `)AI( כלי הבינה`. Brackets are the one place where a
+# right-to-left line put back in the wrong order shows itself without a
+# dictionary -- the same lines have their Latin words and numbers on the wrong
+# side of the Hebrew, which reads as plausible text and trips nothing else.
+#
+# Measured (2026-10-10) on six Hebrew documents: before the reordering fix in
+# `_pdf_converter.py` (`_visual_to_logical`) four of them had 3, 13, 21 and 45
+# such lines; after it, 0 or 1 each (the 1 is a table cell left unreordered).
+# The threshold sits between those groups.
+_REVERSED_BRACKET_LINE_THRESHOLD = 5
+_BRACKET_PATTERN = re.compile(r"[()\[\]]")
+_HEBREW_LETTER_PATTERN = re.compile(r"[א-ת]")
+
+
+def _reversed_bracket_lines(markdown: str) -> list[str]:
+    reversed_lines = []
+    for line in markdown.splitlines():
+        if not _HEBREW_LETTER_PATTERN.search(line):
+            continue
+        brackets = _BRACKET_PATTERN.findall(line)
+        if len(brackets) >= 2 and brackets[0] in ")]" and brackets[-1] in "([":
+            reversed_lines.append(line)
+    return reversed_lines
+
+
 # Unicode block for Hebrew (letters, points, punctuation).
 _HEBREW_BLOCK_START = 0x0590
 _HEBREW_BLOCK_END = 0x05FF
@@ -225,7 +252,9 @@ def _validate(markdown: str, ocr_derived: bool = False) -> tuple[list[str], bool
     misleading -- currently: a Hebrew orthography-violation rate far above
     this project's own known-good baselines, or at least a few lines with a
     symbol standing where a Hebrew letter should be (the rate cannot see
-    those; see `_HEBREW_SYMBOL_SUBSTITUTION_PATTERN`), or OCR output that
+    those; see `_HEBREW_SYMBOL_SUBSTITUTION_PATTERN`), or several Hebrew
+    lines with their brackets back to front (mixed-direction lines put
+    together in the wrong order; see `_reversed_bracket_lines`), or OCR output that
     does not read as text (`ocr_derived`: the PDF had no text layer and the
     text was read from page images; see `_OCR_WORDLIKE_PATTERN`). There is no automatic
     correction available for that case (the two engines available on this
@@ -285,6 +314,17 @@ def _validate(markdown: str, ocr_derived: bool = False) -> tuple[list[str], bool
             f"Hebrew letter should be (for example: \"{example}\") -- a sign "
             "of a font whose characters this app could not decode correctly. "
             "Please review the output before relying on it."
+        )
+
+    reversed_brackets = _reversed_bracket_lines(markdown)
+    if len(reversed_brackets) >= _REVERSED_BRACKET_LINE_THRESHOLD:
+        needs_confirmation = True
+        example = reversed_brackets[0].strip()[:80]
+        warnings.append(
+            f"{len(reversed_brackets)} Hebrew lines have their brackets back to "
+            f"front (for example: \"{example}\") -- a sign that lines mixing "
+            "Hebrew with English words or numbers were put together in the "
+            "wrong order. Please review the output before relying on it."
         )
 
     if ocr_derived:
